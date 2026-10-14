@@ -24,11 +24,13 @@ const translationRules = `你是一位精通中日双语与ACGN文化的资深�
 4. 【专有名词与拟声词】：
    - 术语表（Glossary）具有最高优先级；未收录的专有名词需结合语境译为自然的中文，严禁残留未翻译的平假名或片假名（TS、SNS、OK等常见英文缩写除外）。
    - 日文拟声词与拟态词需转化为贴切的中文象声词或状态描写。
+   - 角色名字需保持一致性，且必须使用中文，多节式姓名使用“·”分割。
+   - 非必要不出现日文单词。
 
 5. 【标点符号强一致性规范】：
-   - 对话引号统一使用『「」』与『『』』。
+   - 对话引号统一使用『「」』与『『』』，视原文而定，注意保持一致与闭合。
    - 【重要】对话『「」』及心理活动『（）』的句末若以普通陈述结束，统一不加句号（如：「原来如此」），仅在感叹号、问号或省略号时保留对应标点（如：「真的吗！？」），全篇各批次必须保持绝对一致，禁止中途切换为句末加句号的格式。
-   - 将日文的『…』『――』规范转换为中文标准的『……』与『——』（占两格）。若遇假名注音（如：漢字《ルビ》），请根据语境保留汉字或以括号形式妥善处理，不要丢弃关键双关信息。
+   - 将日文的『…』『――』规范转换必须为中文标准的『……』与『——』（占两格）。若遇假名注音（如：漢字《ルビ》），请根据语境保留汉字或以括号形式妥善处理，不要丢弃关键双关信息。
    
 6. 【翻译一致性】：
    - 禁止夸张化表达。
@@ -73,6 +75,8 @@ export function buildDeltaSystemPrompt(
 
 export function buildDeltaBatchPrompt(session: DeltaChapterSession): string {
   const batch = session.batches[session.cursor];
+  // A split at cursor zero continues the existing conversation, too.
+  const firstPrompt = session.messages.length === 0;
   const paragraphs = session.paragraphs.filter((paragraph) =>
     batch.paragraphIds.includes(paragraph.id),
   );
@@ -80,15 +84,12 @@ export function buildDeltaBatchPrompt(session: DeltaChapterSession): string {
   const glossary = Object.keys(session.glossary)
     .sort()
     .filter((term) =>
-      (session.cursor === 0 ? session.source.join('\n') : source).includes(
-        term,
-      ),
+      (firstPrompt ? session.source.join('\n') : source).includes(term),
     )
     .map((term) => `${term}: ${session.glossary[term]}`)
     .join('\n');
-  const fullSource =
-    session.cursor === 0
-      ? `<chapter_source>\n${session.paragraphs.map((p) => `${p.id}: ${p.source}`).join('\n')}\n</chapter_source>\n\n`
-      : '';
+  const fullSource = firstPrompt
+    ? `<chapter_source>\n${session.paragraphs.map((p) => `${p.id}: ${p.source}`).join('\n')}\n</chapter_source>\n\n`
+    : '';
   return `${fullSource}<glossary>\n${glossary}\n</glossary>\n\n<current_batch id="${batch.id}">\n${paragraphs.map((p) => `${p.id}: ${p.source}`).join('\n')}\n</current_batch>\n\n请通过 submit_batch 提交本批所有非空段落译文。`;
 }

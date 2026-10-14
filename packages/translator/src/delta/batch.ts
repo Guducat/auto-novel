@@ -62,6 +62,7 @@ export function validateSubmitBatch(
   if (!Array.isArray(args.entries)) return { error: 'entries 必须是数组' };
   const authorized = new Set(batch.paragraphIds);
   const seen = new Set<string>();
+  const errors: string[] = [];
   for (const entry of args.entries) {
     if (
       !entry ||
@@ -75,18 +76,30 @@ export function validateSubmitBatch(
       )
     )
       return { error: '译文条目含有未知参数' };
-    if (!authorized.has(entry.paragraphId))
-      return { error: `段落 ${entry.paragraphId} 不在当前批授权范围内` };
-    if (seen.has(entry.paragraphId))
-      return { error: `段落 ${entry.paragraphId} 重复` };
-    if (!entry.translation.trim())
-      return { error: `段落 ${entry.paragraphId} 译文为空` };
-    if (/[\r\n\u2028\u2029]/.test(entry.translation))
-      return { error: `段落 ${entry.paragraphId} 不能包含换行` };
+    if (!authorized.has(entry.paragraphId)) {
+      errors.push(
+        `段落 ${entry.paragraphId} 不在当前批授权范围内，请删除该条目`,
+      );
+      continue;
+    }
+    if (seen.has(entry.paragraphId)) {
+      errors.push(`段落 ${entry.paragraphId} 重复，每个 ID 只保留一条译文`);
+      continue;
+    }
     seen.add(entry.paragraphId);
+    if (!entry.translation.trim())
+      errors.push(`段落 ${entry.paragraphId} 译文为空，请补充非空译文`);
+    if (/[\r\n\u2028\u2029]/.test(entry.translation))
+      errors.push(
+        `段落 ${entry.paragraphId} 不能包含换行，请将译文写在一个字符串内`,
+      );
   }
-  if (seen.size !== authorized.size)
-    return { error: '必须完整提交当前批所有非空段落' };
+  const missing = batch.paragraphIds.filter((id) => !seen.has(id));
+  if (missing.length) errors.push(`缺失 paragraphId：${missing.join(', ')}`);
+  if (errors.length)
+    return {
+      error: `当前批期望 ${authorized.size} 段，收到 ${args.entries.length} 条条目，覆盖 ${seen.size} 个授权 ID。${errors.join('；')}`,
+    };
   return { entries: args.entries };
 }
 

@@ -41,6 +41,7 @@ export interface DeltaParagraph {
 }
 
 export interface DeltaBatch {
+  /** Split children append .1/.2 to their parent's stable ID. */
   id: string;
   paragraphIds: string[];
 }

@@ -1,6 +1,6 @@
 import type { SegmentTracker, LineRange } from '@auto-novel/translator';
 
-export type ChapterStatus = 'pending' | 'translating' | 'done' | 'error';
+export type ChapterStatus = 'pending' | 'translating' | 'done' | 'error' | 'paused';
 export type SegmentStatus = 'pending' | 'translating' | 'done' | 'error';
 
 export interface ChapterMeta {

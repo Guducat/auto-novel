@@ -92,9 +92,26 @@ export function reopenDeltaRetryWindow(
   session: DeltaChapterSession,
 ): DeltaChapterSession {
   const next = structuredClone(session);
+  const lastRequest = next.requests[next.requests.length - 1];
+  // Older checkpoints may already have exhausted a larger batch.
+  if (
+    lastRequest?.batchId === next.batches[next.cursor]?.id &&
+    lastRequest.status === 'rejected' &&
+    next.pauseReason &&
+    (next.retry.attempts >= 3 || next.retry.outputBudgetIncreased) &&
+    splitCurrentBatch(next)
+  )
+    return next;
   next.retry.window++;
   next.retry.attempts = 0;
   next.pauseReason = undefined;
+  if (lastRequest?.status === 'rejected' && lastRequest.error) {
+    next.messages.push({
+      role: 'user',
+      content: buildBatchRepairFeedback(next, lastRequest.error),
+      timestamp: Date.now(),
+    });
+  }
   return next;
 }
 
@@ -115,6 +132,60 @@ function finish(session: DeltaChapterSession) {
   session.pauseReason = undefined;
 }
 
+/** Replace only the rejected batch; paragraph IDs, accepted text and native history stay intact. */
+function splitCurrentBatch(session: DeltaChapterSession): boolean {
+  const batch = session.batches[session.cursor];
+  if (!batch || batch.paragraphIds.length < 2) return false;
+  const midpoint = Math.ceil(batch.paragraphIds.length / 2);
+  const children = [
+    {
+      id: `${batch.id}.1`,
+      paragraphIds: batch.paragraphIds.slice(0, midpoint),
+    },
+    { id: `${batch.id}.2`, paragraphIds: batch.paragraphIds.slice(midpoint) },
+  ];
+  session.batches.splice(session.cursor, 1, ...children);
+  session.promptCursor = -1;
+  session.pauseReason = undefined;
+  session.retry = {
+    ...session.retry,
+    batchId: children[0].id,
+    window: 1,
+    attempts: 0,
+    outputBudgetIncreased: false,
+    nextRequestParams: undefined,
+  };
+  session.messages.push({
+    role: 'user',
+    content: `批次 ${batch.id} 多次提交失败，已撤销该批授权并按段落顺序二分为 ${children.map((child) => `${child.id}（${child.paragraphIds.length} 段）`).join('、')}。此前失败提交未接受任何译文。接下来仅提交新 current_batch 授权的 ID，不要再次提交旧 batchId，也不要合并两个子批。`,
+    timestamp: Date.now(),
+  });
+  return true;
+}
+
+function buildBatchRepairFeedback(
+  session: DeltaChapterSession,
+  error: string,
+): string {
+  const batch = session.batches[session.cursor];
+  const failures = session.requests.filter(
+    (request) => request.batchId === batch.id && request.status === 'rejected',
+  );
+  const previous = failures[failures.length - 1];
+  return [
+    `批次 ${batch.id} 校验失败：${error}`,
+    previous
+      ? `${previous.error === error ? '同一错误再次出现' : '本批已多次提交失败'}（此前 ${failures.length} 次）。请先逐项核对下列授权 ID，修正后再提交，不要重复上一份错误参数。`
+      : '',
+    `batchId 必须为 ${batch.id}；entries 必须恰好包含 ${batch.paragraphIds.length} 条译文，paragraphId 完整覆盖：${JSON.stringify(batch.paragraphIds)}。`,
+    '本次提交未接受任何译文。保留已正确的译文并重新完整提交本批，不能只补缺失项，也不能跳到下一批。',
+    '每项仅含 paragraphId 和 translation；translation 必须是非空、无换行的译文。删除越界条目，每个授权 ID 只能出现一次。',
+    '仅调用一次 submit_batch，译文写入工具参数；普通正文或思考过程不能代替工具提交。',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
 function settlePending(session: DeltaChapterSession) {
   const pending = session.pendingAssistant!;
   const { message } = pending;
@@ -130,11 +201,14 @@ function settlePending(session: DeltaChapterSession) {
   let error: string | undefined;
   let entries: ReturnType<typeof validateSubmitBatch>['entries'];
   if (message.stopReason === 'length')
-    error = '模型输出截断；不执行不完整工具调用。';
-  else if (calls.length !== 1) error = '每轮必须且只能调用一次 submit_batch。';
+    error =
+      '模型输出截断；不执行不完整工具调用。请重新生成完整参数，不要续写截断的 JSON。';
+  else if (calls.length !== 1)
+    error = `每轮必须且只能调用一次 submit_batch，本次调用 ${calls.length} 次。`;
   else if (calls[0].name !== 'submit_batch')
     error = '仅允许 submit_batch 工具。';
   else ({ error, entries } = validateSubmitBatch(session, calls[0].arguments));
+  const feedback = error ? buildBatchRepairFeedback(session, error) : undefined;
   for (const call of calls) {
     session.messages.push({
       role: 'toolResult',
@@ -143,7 +217,8 @@ function settlePending(session: DeltaChapterSession) {
       content: [
         {
           type: 'text',
-          text: error ?? `批次 ${session.batches[session.cursor].id} 已接受。`,
+          text:
+            feedback ?? `批次 ${session.batches[session.cursor].id} 已接受。`,
         },
       ],
       isError: !!error,
@@ -153,7 +228,7 @@ function settlePending(session: DeltaChapterSession) {
   if (error && !calls.length)
     session.messages.push({
       role: 'user',
-      content: `${error} 请使用 submit_batch 修复当前批。`,
+      content: feedback!,
       timestamp: Date.now(),
     });
   record.status = error ? 'rejected' : 'accepted';
@@ -183,6 +258,11 @@ function settlePending(session: DeltaChapterSession) {
         };
       }
     }
+    if (
+      (session.retry.attempts >= 3 || session.pauseReason) &&
+      splitCurrentBatch(session)
+    )
+      return;
     if (session.retry.attempts >= 3)
       session.pauseReason ??= '当前批已达到 3 次请求上限，请显式重试。';
     return;

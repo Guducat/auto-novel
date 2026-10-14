@@ -18,6 +18,7 @@ const props = defineProps<{
   running: boolean;
   concurrency: { current: number; max: number };
   errorCount: number;
+  pausedCount?: number;
   deltaResume?: boolean;
   deltaDisabled?: boolean;
   startDisabled?: boolean;
@@ -103,6 +104,15 @@ const testWorker = async () => {
         >
           ✕ {{ errorCount }}
         </n-tag>
+        <n-tag
+          v-if="pausedCount"
+          size="tiny"
+          type="warning"
+          :bordered="false"
+          class="viz-paused-tag"
+        >
+          ⏸ {{ pausedCount }} 暂停
+        </n-tag>
       </span>
     </template>
     <template #header-extra>
@@ -126,7 +136,7 @@ const testWorker = async () => {
         />
         <c-button
           v-if="translatorId === 'gpt' && !running"
-          :label="deltaResume ? '继续（Delta）' : '启动（Delta）'"
+          :label="deltaResume ? 'Delta 继续' : 'Delta 启动'"
           :icon="PlayArrowOutlined"
           size="tiny"
           secondary

@@ -16,12 +16,14 @@ import type {
   TranslationTask,
   TranslatorId,
 } from '@/domain/translator/TranslationTask/types';
+import type { DeltaChapterSession } from '@auto-novel/translator';
 
 const props = defineProps<{
   job: TranslateJob;
   translatorId: TranslatorId;
   taskState?: TaskState;
   taskCacheEntry?: TranslationTask;
+  deltaSessions?: DeltaChapterSession[];
 }>();
 
 const emit = defineEmits<{
@@ -29,7 +31,46 @@ const emit = defineEmits<{
   top: [task: string];
   bottom: [task: string];
   retry: [task: string];
+  retryDelta: [task: string];
 }>();
+
+const taskDeltaSessions = computed(() => {
+  return (props.deltaSessions ?? []).filter(
+    (s) => s.identity.taskId === props.job.task,
+  );
+});
+
+const hasDelta = computed(() => taskDeltaSessions.value.length > 0);
+
+const deltaActiveCount = computed(
+  () =>
+    taskDeltaSessions.value.filter(
+      (s) =>
+        s.phase === 'translating' ||
+        s.phase === 'submitting' ||
+        s.phase === 'readyToSubmit',
+    ).length,
+);
+
+const deltaCompletedCount = computed(
+  () => taskDeltaSessions.value.filter((s) => s.phase === 'completed').length,
+);
+
+const deltaPausedCount = computed(
+  () => taskDeltaSessions.value.filter((s) => !!s.pauseReason).length,
+);
+
+const deltaTotalCacheRead = computed(() => {
+  return taskDeltaSessions.value
+    .flatMap((s) => s.requests)
+    .reduce((sum, r) => sum + (r.usage?.cacheRead ?? 0), 0);
+});
+
+const deltaTotalOutput = computed(() => {
+  return taskDeltaSessions.value
+    .flatMap((s) => s.requests)
+    .reduce((sum, r) => sum + (r.usage?.output ?? 0), 0);
+});
 
 const jobRecord = computed(() => props.job as TranslateJobRecord);
 const chapterMetas = computed(() => props.taskState?.chapters ?? []);
@@ -89,26 +130,52 @@ function retryAllFailed() {
 }
 
 function hasFailedChapters(): boolean {
-  return chapterMetas.value.some((c) => c.status === 'error');
+  return (
+    chapterMetas.value.some((c) => c.status === 'error') ||
+    deltaPausedCount.value > 0
+  );
 }
 
 defineExpose({ retryAllFailed, hasFailedChapters });
+
+import ChapterPreviewModal from './ChapterPreviewModal.vue';
+import DeltaPreviewModal from './DeltaPreviewModal.vue';
 
 function createTask(taskDesc: string): TranslationTask {
   const { desc, params } = TranslateTaskDescriptor.parse(taskDesc);
   return createTranslationTask(desc, props.translatorId, params);
 }
 
-const showPreview = ref(false);
-const previewData = ref<{
-  title: string;
-  chapterState: ChapterSegmentState | null;
-} | null>(null);
+const totalChaptersCount = computed(
+  () => chapterMetas.value.length || 0,
+);
+
+const showDeltaPreview = ref(false);
+const showPipelinePreview = ref(false);
+const previewTitle = ref('');
+const previewChapterId = ref<string | null>(null);
+const pipelineChapterState = ref<ChapterSegmentState | null>(null);
+
+const activeDeltaSession = computed(() => {
+  if (!previewChapterId.value) return null;
+  return (
+    taskDeltaSessions.value.find(
+      (s) => s.identity.chapterId === previewChapterId.value,
+    ) ?? null
+  );
+});
+
 const openPreview = async (chapterId: string) => {
   try {
+    previewChapterId.value = chapterId;
     const chapters = await getChapterMetas();
     const meta = chapters.find((c) => c.chapterId === chapterId);
-    const title = meta?.title ?? chapterId;
+    previewTitle.value = meta?.title ?? chapterId;
+
+    if (activeDeltaSession.value) {
+      showDeltaPreview.value = true;
+      return;
+    }
 
     const chapterState = props.taskState?.chapterStates.get(chapterId);
 
@@ -139,22 +206,12 @@ const openPreview = async (chapterId: string) => {
       }
     }
 
-    previewData.value = { title, chapterState: chapterStateForPreview };
-    showPreview.value = true;
+    pipelineChapterState.value = chapterStateForPreview;
+    showPipelinePreview.value = true;
   } catch (e) {
     console.error('加载预览失败', e);
     Toast.error('加载预览失败');
   }
-};
-
-const closePreview = () => {
-  showPreview.value = false;
-  // 延迟清除数据，让 modal 关闭动画完成后再释放内容
-  setTimeout(() => {
-    if (!showPreview.value) {
-      previewData.value = null;
-    }
-  }, 200);
 };
 </script>
 
@@ -179,7 +236,16 @@ const closePreview = () => {
             <div class="task-name">{{ job.description }}</div>
             <job-task-link :task="job.task" class="task-link" />
           </div>
-          <n-flex :size="8" align="center" :wrap="false" style="flex-shrink: 0">
+          <n-flex :size="6" align="center" :wrap="false" style="flex-shrink: 0">
+            <n-tag
+              v-if="hasDelta"
+              size="tiny"
+              :bordered="false"
+              :type="deltaActiveCount > 0 ? 'info' : 'primary'"
+              class="delta-badge"
+            >
+              Delta{{ deltaActiveCount > 0 ? ` · ${deltaActiveCount} 进行中` : '' }}
+            </n-tag>
             <n-tag v-if="taskStatus === 'executing'" size="tiny" type="info">
               翻译中
             </n-tag>
@@ -268,6 +334,47 @@ const closePreview = () => {
     </template>
 
     <div v-if="expanded && chapterMetas.length">
+      <!-- Delta 状态摘要条 -->
+      <div v-if="hasDelta" class="delta-card-strip">
+        <n-flex align="center" justify="space-between" :wrap="false">
+          <n-flex align="center" :size="6">
+            <span class="delta-strip-label">Delta 进度:</span>
+            <n-tag size="tiny" :bordered="false" type="success">
+              完成 {{ deltaCompletedCount }}/{{ totalChaptersCount }}
+            </n-tag>
+            <n-tag
+              v-if="deltaActiveCount"
+              size="tiny"
+              :bordered="false"
+              type="info"
+            >
+              进行中 {{ deltaActiveCount }}
+            </n-tag>
+            <n-tag
+              v-if="deltaPausedCount"
+              size="tiny"
+              :bordered="false"
+              type="warning"
+            >
+              暂停 {{ deltaPausedCount }}
+            </n-tag>
+          </n-flex>
+          <n-flex align="center" :size="6">
+            <n-text depth="3" class="delta-strip-metric">
+              读取缓存: {{ deltaTotalCacheRead.toLocaleString() }} · 输出: {{ deltaTotalOutput.toLocaleString() }}
+            </n-text>
+            <c-button
+              v-if="deltaPausedCount"
+              label="重试失败"
+              size="tiny"
+              secondary
+              type="warning"
+              @action="emit('retryDelta', job.task)"
+            />
+          </n-flex>
+        </n-flex>
+      </div>
+
       <chapter-grid
         :task-state="taskState"
         @preview="(cid: string) => openPreview(cid)"
@@ -275,15 +382,18 @@ const closePreview = () => {
     </div>
   </n-card>
 
+  <delta-preview-modal
+    :show="showDeltaPreview"
+    :title="previewTitle"
+    :session="activeDeltaSession"
+    @update:show="(v: boolean) => (showDeltaPreview = v)"
+  />
+
   <chapter-preview-modal
-    :show="showPreview"
-    :title="previewData?.title ?? ''"
-    :chapter-state="previewData?.chapterState ?? null"
-    @update:show="
-      (v: boolean) => {
-        if (!v) closePreview();
-      }
-    "
+    :show="showPipelinePreview"
+    :title="previewTitle"
+    :chapter-state="pipelineChapterState"
+    @update:show="(v: boolean) => (showPipelinePreview = v)"
   />
 </template>
 
@@ -301,6 +411,24 @@ const closePreview = () => {
 .task-link {
   font-size: 11px;
   line-height: 1.2;
+}
+.delta-badge {
+  font-weight: 500;
+  letter-spacing: 0.3px;
+}
+.delta-card-strip {
+  margin-bottom: 8px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: rgba(128, 128, 128, 0.06);
+}
+.delta-strip-label {
+  font-size: 11px;
+  font-weight: 500;
+  opacity: 0.8;
+}
+.delta-strip-metric {
+  font-size: 11px;
 }
 .task-progress {
   font-size: 12px;

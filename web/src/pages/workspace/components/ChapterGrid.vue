@@ -22,7 +22,8 @@ const chapters = computed(() => {
     let displayStatus = ch.status;
     if (
       displayStatus === 'translating' &&
-      (!chState?.ready || chState.translatingCount === 0)
+      chState?.ready &&
+      chState.translatingCount === 0
     ) {
       displayStatus = 'pending';
     }
@@ -164,6 +165,19 @@ function pct(sp: { completed: number; total: number } | undefined): number {
   border-color: color-mix(
     in srgb,
     v-bind('themeVars.errorColor') 35%,
+    transparent
+  );
+}
+.c--paused {
+  background: color-mix(
+    in srgb,
+    v-bind('themeVars.warningColor') 10%,
+    transparent
+  );
+  color: v-bind('themeVars.warningColor');
+  border-color: color-mix(
+    in srgb,
+    v-bind('themeVars.warningColor') 35%,
     transparent
   );
 }

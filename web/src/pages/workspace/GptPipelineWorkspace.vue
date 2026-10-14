@@ -3,8 +3,10 @@ import { Toast } from '@novelia/web-kit';
 import {
   BookOutlined,
   DeleteOutlineOutlined,
+  PlayArrowOutlined,
   PlusOutlined,
   RefreshOutlined,
+  StopOutlined,
 } from '@vicons/material';
 import { VueDraggable } from 'vue-draggable-plus';
 import {
@@ -36,7 +38,6 @@ import type {
 } from '@/model/Translator';
 import { TranslateTaskDescriptor } from '@/model/Translator';
 import PipelineTaskCard from './components/PipelineTaskCard.vue';
-import DeltaRunPanel from './components/DeltaRunPanel.vue';
 import { DeltaController } from '@/domain/translator/delta/DeltaController';
 import { IndexedDbDeltaSessionStore } from '@/domain/translator/delta/IndexedDbDeltaSessionStore';
 import { createDeltaTaskSource } from '@/domain/translator/delta/DeltaTaskSource';
@@ -57,6 +58,57 @@ const jobStore = useWorkspaceStore(props.translatorId);
 
 const jobs = computed(() => jobStore.ref.value.jobs);
 const selectedMode = ref<WorkspaceMode>('pipeline');
+
+interface WorkerState {
+  running: boolean;
+  concurrency: { current: number; max: number };
+  allowUpload?: boolean;
+}
+
+// ========== 任务状态管理 ==========
+const taskStates = ref(new Map<string, TaskState>());
+const taskCache = new Map<string, TranslationTask>();
+const taskVersions = ref(new Map<string, number>());
+
+function syncDeltaSessionsToTasks(sessions: DeltaChapterSession[]) {
+  for (const session of sessions) {
+    const taskId = session.identity.taskId;
+    const chapterId = session.identity.chapterId;
+    const state = taskStates.value.get(taskId);
+    if (!state) continue;
+    const ch = state.chapters.find((c) => c.chapterId === chapterId);
+    if (ch) {
+      if (session.phase === 'completed') {
+        ch.status = 'done';
+      } else if (session.pauseReason) {
+        ch.status = session.pauseReason.includes('停止') ? 'pending' : 'paused';
+      } else if (
+        session.phase === 'translating' ||
+        session.phase === 'submitting' ||
+        session.phase === 'readyToSubmit'
+      ) {
+        ch.status = 'translating';
+      }
+      ch.segmentProgress = {
+        completed:
+          session.phase === 'completed'
+            ? session.batches.length
+            : session.cursor,
+        total: session.batches.length,
+      };
+    }
+    const job = jobs.value.find((j) => j.task === taskId);
+    if (job) {
+      const doneCount = state.chapters.filter((c) => c.status === 'done').length;
+      (job as TranslateJobRecord).progress = {
+        finished: doneCount,
+        error: state.chapters.filter((c) => c.status === 'error').length,
+        total: state.chapters.length,
+      };
+    }
+  }
+}
+
 const deltaSessions = shallowRef<DeltaChapterSession[]>([]);
 const deltaWorkerStates = ref(new Map<string, WorkerState>());
 const deltaRuns = reactive(new Map<string, Promise<void>>());
@@ -78,12 +130,45 @@ const delta = isSakura.value
       jobs: () => jobs.value,
       onSessions: (sessions) => {
         deltaSessions.value = sessions;
+        syncDeltaSessionsToTasks(sessions);
       },
       onWorkerChange: (id, running, current, max) => {
         deltaWorkerStates.value.set(id, {
           running,
           concurrency: { current, max },
         });
+      },
+      onChapterChange: (taskId, chapterId, status, session) => {
+        const state = taskStates.value.get(taskId);
+        if (state) {
+          const ch = state.chapters.find((c) => c.chapterId === chapterId);
+          if (ch) {
+            ch.status =
+              session?.pauseReason
+                ? session.pauseReason.includes('停止')
+                  ? 'pending'
+                  : 'paused'
+                : status;
+            if (session) {
+              ch.segmentProgress = {
+                completed:
+                  session.phase === 'completed'
+                    ? session.batches.length
+                    : session.cursor,
+                total: session.batches.length,
+              };
+            }
+          }
+          const job = jobs.value.find((j) => j.task === taskId);
+          if (job) {
+            const doneCount = state.chapters.filter((c) => c.status === 'done').length;
+            (job as TranslateJobRecord).progress = {
+              finished: doneCount,
+              error: state.chapters.filter((c) => c.status === 'error').length,
+              total: state.chapters.length,
+            };
+          }
+        }
       },
       onTaskDone: (taskId, total) => {
         const job = jobs.value.find((job) => job.task === taskId);
@@ -139,17 +224,6 @@ const pipeline = new TranslationPipeline(
   isSakura.value ? 'chapter' : 'segment',
 );
 
-// ========== 任务状态管理 ==========
-
-const taskStates = ref(new Map<string, TaskState>());
-const taskCache = new Map<string, TranslationTask>();
-const taskVersions = ref(new Map<string, number>());
-
-interface WorkerState {
-  running: boolean;
-  concurrency: { current: number; max: number };
-  allowUpload?: boolean;
-}
 const workerStates = ref(new Map<string, WorkerState>());
 const workerErrors = computed(() => {
   const errors = new Map<string, number>();
@@ -396,7 +470,7 @@ async function acquireMode(mode: WorkspaceMode): Promise<boolean> {
     jobs.value.some((job) => delta?.taskHasDrafts(job.task))
   ) {
     Toast.warning(
-      '请先通过“放弃 Delta 检查点”确认放弃未完成草稿，再使用原启动',
+      '请先通过“数据管理”清除未完成的 Delta 数据，再使用默认启动',
     );
     return false;
   }
@@ -535,19 +609,36 @@ async function startAllDeltaWorkers() {
   );
 }
 
-async function stopAllWorkers() {
-  for (const workerId of pendingStarts) cancelledStarts.add(workerId);
-  for (const worker of workerStore.ref.value.workers)
+async function stopPipelineAll() {
+  for (const workerId of pendingStarts) {
+    if (!deltaWorkerStates.value.get(workerId)?.running) {
+      cancelledStarts.add(workerId);
+    }
+  }
+  for (const worker of workerStore.ref.value.workers) {
     stopPipelineWorker(worker.id);
+  }
+  await releasePipeline();
+}
+
+async function stopDeltaAll() {
+  for (const workerId of pendingStarts) {
+    if (deltaWorkerStates.value.get(workerId)?.running) {
+      cancelledStarts.add(workerId);
+    }
+  }
   const stoppingDelta = delta?.stopAll() ?? Promise.resolve();
   await Promise.all([
-    releasePipeline(),
     releaseMode(
       'delta',
       Promise.allSettled([stoppingDelta, ...deltaRuns.values()]),
     ),
     stoppingDelta,
   ]);
+}
+
+async function stopAllWorkers() {
+  await Promise.all([stopPipelineAll(), stopDeltaAll()]);
 }
 
 function workerRunning(workerId: string) {
@@ -570,11 +661,15 @@ function workerConcurrency(worker: GptPipelineWorker | SakuraWorker) {
   );
 }
 function workerErrorCount(workerId: string) {
-  return selectedMode.value === 'delta'
-    ? deltaSessions.value.filter(
-        (session) => session.workerId === workerId && session.pauseReason,
-      ).length
-    : workerErrors.value.get(workerId) ?? 0;
+  return workerErrors.value.get(workerId) ?? 0;
+}
+function workerDeltaPausedCount(workerId: string) {
+  return deltaSessions.value.filter(
+    (session) =>
+      session.workerId === workerId &&
+      session.pauseReason &&
+      !session.pauseReason.includes('停止'),
+  ).length;
 }
 function canResumeDelta(workerId: string) {
   return deltaSessions.value.some(
@@ -597,14 +692,80 @@ async function discardDelta() {
       async () => {
         await deltaReady;
         await delta.load();
-        await Toast.promise(delta.clear(), {
-          success: 'Delta 检查点放弃成功',
-          error: 'Delta 检查点放弃失败',
-        });
+        const before = [...deltaSessions.value];
+        try {
+          await Toast.promise(delta.clear(), {
+            success: 'Delta 数据清空成功',
+            error: 'Delta 数据清空失败',
+          });
+        } finally {
+          for (const session of before) {
+            const chapter = taskStates.value
+              .get(session.identity.taskId)
+              ?.chapters.find(
+                (ch) => ch.chapterId === session.identity.chapterId,
+              );
+            if (chapter) {
+              chapter.segmentProgress = undefined;
+              if (chapter.status === 'translating' || chapter.status === 'paused') {
+                chapter.status = 'pending';
+              }
+            }
+          }
+        }
       },
     );
     if (!maintained)
-      Toast.warning('工作区正在运行或启动，请停止并等待完成后放弃检查点');
+      Toast.warning('工作区正在运行或启动，请停止并等待完成后清空数据');
+  } finally {
+    checkpointRefresh = undefined;
+    maintainingCheckpoints.value = false;
+  }
+}
+
+async function discardDeltaScope(
+  scope: { sessionId: string } | { novelId: string },
+) {
+  if (
+    !delta ||
+    !workspaceExecution ||
+    deltaBusy.value ||
+    hasRunningWorker() ||
+    pipelineDraining.value
+  )
+    return;
+  maintainingCheckpoints.value = true;
+  try {
+    await Toast.promise(
+      workspaceExecution.runMaintenance('delta', async () => {
+        await deltaReady;
+        await delta.load();
+        const before = deltaSessions.value;
+        try {
+          if ('sessionId' in scope) await delta.discardChapter(scope.sessionId);
+          else await delta.discardNovel(scope.novelId);
+        } finally {
+          const remaining = new Set(deltaSessions.value.map((s) => s.id));
+          for (const session of before) {
+            if (remaining.has(session.id)) continue;
+            const chapter = taskStates.value
+              .get(session.identity.taskId)
+              ?.chapters.find(
+                (ch) => ch.chapterId === session.identity.chapterId,
+              );
+            if (chapter) {
+              chapter.segmentProgress = undefined;
+              if (chapter.status === 'translating' || chapter.status === 'paused') {
+                chapter.status = 'pending';
+              }
+            }
+          }
+        }
+      }).then((maintained) => {
+        if (!maintained) throw new Error('工作区忙碌');
+      }),
+      { success: '清除数据成功', error: '清除数据失败' },
+    );
   } finally {
     checkpointRefresh = undefined;
     maintainingCheckpoints.value = false;
@@ -640,7 +801,7 @@ const deleteJob = (task: string) => {
     delta?.hasTask(task) ||
     delta?.taskHasDrafts(task)
   ) {
-    Toast.error('任务正在翻译或有未完成 Delta 检查点，请先停止并放弃检查点');
+    Toast.error('任务正在翻译或有未完成的 Delta 数据，请先停止并在数据管理中清除');
     return;
   }
   jobStore.deleteJob(task);
@@ -731,6 +892,7 @@ watch(
           ) {
             job.finishAt = Date.now();
           }
+          syncDeltaSessionsToTasks(deltaSessions.value);
         } catch (e) {
           console.warn('任务初始化失败', job.task, e);
         }
@@ -759,40 +921,60 @@ watch(
       />
     </section-header>
 
-    <n-flex vertical>
-      <c-action-wrapper title="操作" align="center">
-        <n-button-group size="small">
-          <c-button
-            label="启动全部"
-            :round="false"
-            :disabled="maintainingCheckpoints"
-            @action="startAllWorkers"
-          />
-          <c-button
-            v-if="!isSakura"
-            label="启动全部（Delta）"
-            :disabled="maintainingCheckpoints"
-            :round="false"
-            @action="startAllDeltaWorkers"
-          />
-          <c-button label="停止全部" :round="false" @action="stopAllWorkers" />
-          <c-button-confirm
-            hint="真的要清空缓存吗？"
-            label="清空缓存"
-            :icon="DeleteOutlineOutlined"
-            :round="false"
-            @action="clearCache"
-          />
-          <c-button-confirm
-            v-if="!isSakura"
-            hint="放弃全部 Delta 会话、草稿与恢复检查点？此操作无法撤销。"
-            label="放弃 Delta 检查点"
-            :round="false"
-            :disabled="deltaBusy || pipelineDraining || hasRunningWorker()"
-            @action="discardDelta"
-          />
-        </n-button-group>
-      </c-action-wrapper>
+    <n-flex vertical style="margin-bottom: 8px">
+      <n-flex align="center" justify="space-between" :wrap="true" style="gap: 12px">
+        <!-- 默认模式 (常规分块流水线) -->
+        <c-action-wrapper title="默认" align="center">
+          <n-button-group size="small">
+            <c-button
+              label="启动全部"
+              :icon="PlayArrowOutlined"
+              :round="false"
+              :disabled="maintainingCheckpoints || deltaBusy"
+              @action="startAllWorkers"
+            />
+            <c-button
+              label="停止全部"
+              :icon="StopOutlined"
+              :round="false"
+              @action="stopPipelineAll"
+            />
+            <c-button-confirm
+              hint="真的要清空分块缓存吗？"
+              label="清空缓存"
+              :icon="DeleteOutlineOutlined"
+              :round="false"
+              @action="clearCache"
+            />
+          </n-button-group>
+        </c-action-wrapper>
+
+        <!-- Delta 模式 (上下文整章断点续译) -->
+        <c-action-wrapper v-if="!isSakura" title="Delta" align="center">
+          <n-button-group size="small">
+            <c-button
+              label="启动全部"
+              :icon="PlayArrowOutlined"
+              :round="false"
+              :disabled="maintainingCheckpoints || hasRunningWorker()"
+              @action="startAllDeltaWorkers"
+            />
+            <c-button
+              label="停止全部"
+              :icon="StopOutlined"
+              :round="false"
+              @action="stopDeltaAll"
+            />
+            <delta-checkpoint-manager
+              :sessions="deltaSessions"
+              :disabled="deltaBusy || pipelineDraining || hasRunningWorker()"
+              @discard-chapter="discardDeltaScope({ sessionId: $event })"
+              @discard-novel="discardDeltaScope({ novelId: $event })"
+              @discard-all="discardDelta"
+            />
+          </n-button-group>
+        </c-action-wrapper>
+      </n-flex>
     </n-flex>
 
     <n-empty
@@ -817,6 +999,7 @@ watch(
             :running="workerRunning(w.id)"
             :concurrency="workerConcurrency(w)"
             :error-count="workerErrorCount(w.id)"
+            :paused-count="workerDeltaPausedCount(w.id)"
             :delta-resume="canResumeDelta(w.id)"
             :start-disabled="maintainingCheckpoints"
             @start="startWorker"
@@ -827,18 +1010,6 @@ watch(
         </n-list-item>
       </vue-draggable>
     </n-list>
-
-    <delta-run-panel
-      v-if="!isSakura && (selectedMode === 'delta' || deltaSessions.length > 0)"
-      :sessions="deltaSessions"
-      :active-workers="activeDeltaWorkers"
-      :active-counts="activeDeltaCounts"
-      :disabled="
-        maintainingCheckpoints ||
-        (selectedMode === 'pipeline' && hasRunningWorker())
-      "
-      @retry="(workerId: string) => startDeltaWorker(workerId, true)"
-    />
 
     <section-header title="任务队列">
       <c-button
@@ -876,24 +1047,6 @@ watch(
     </n-flex>
     <n-divider style="margin: 16px 0 8px" />
     <n-empty v-if="filteredJobs.length === 0" description="没有任务" />
-    <div v-else-if="selectedMode === 'delta'" class="task-list">
-      <n-card
-        v-for="job of filteredJobs"
-        :key="job.task"
-        size="small"
-        :title="job.description"
-      >
-        <template #header-extra>
-          <c-button
-            label="删除任务"
-            size="tiny"
-            @action="deleteJob(job.task)"
-          />
-        </template>
-        <job-task-link :task="job.task" />
-        <n-p>{{ deltaJobProgress(job) }}</n-p>
-      </n-card>
-    </div>
     <div v-else class="task-list">
       <pipeline-task-card
         v-for="job of filteredJobs"
@@ -903,8 +1056,10 @@ watch(
         :translator-id="translatorId"
         :task-state="taskStates.get(job.task)"
         :task-cache-entry="taskCache.get(job.task)"
+        :delta-sessions="deltaSessions"
         @delete="deleteJob"
-        @retry="(task: string) => runProcessLoop()"
+        @retry="(task: string) => (selectedMode === 'delta' ? retryDeltaWorkers() : runProcessLoop())"
+        @retry-delta="retryDeltaWorkers"
         @top="
           (task: string) =>
             jobStore.topJob(
