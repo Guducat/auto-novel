@@ -18,10 +18,14 @@ const props = defineProps<{
   running: boolean;
   concurrency: { current: number; max: number };
   errorCount: number;
+  deltaResume?: boolean;
+  deltaDisabled?: boolean;
+  startDisabled?: boolean;
 }>();
 
 const emit = defineEmits<{
   start: [workerId: string];
+  startDelta: [workerId: string];
   stop: [workerId: string];
   delete: [workerId: string];
 }>();
@@ -117,7 +121,17 @@ const testWorker = async () => {
           :icon="PlayArrowOutlined"
           size="tiny"
           secondary
+          :disabled="startDisabled"
           @action="emit('start', worker.id)"
+        />
+        <c-button
+          v-if="translatorId === 'gpt' && !running"
+          :label="deltaResume ? '继续（Delta）' : '启动（Delta）'"
+          :icon="PlayArrowOutlined"
+          size="tiny"
+          secondary
+          :disabled="deltaDisabled || startDisabled"
+          @action="emit('startDelta', worker.id)"
         />
         <c-icon-button
           tooltip="测试"
