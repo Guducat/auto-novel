@@ -101,7 +101,14 @@ export interface DeltaChapterSession {
     outputBudgetIncreased: boolean;
     nextRequestParams?: Record<string, unknown>;
   };
-  phase: 'translating' | 'readyToSubmit' | 'submitting' | 'completed';
+  phase:
+    | 'translating'
+    | 'reviewing'
+    | 'readyToSubmit'
+    | 'submitting'
+    | 'completed';
+  reviewOptions?: DeltaReviewOptions;
+  review?: DeltaReviewState;
   pauseReason?: string;
   finalParagraphs?: string[];
   finalHash?: string;
@@ -121,6 +128,7 @@ export interface CreateDeltaSessionInput {
   batchMaxChars?: number;
   batchMaxParagraphs?: number;
   previousTranslationHash?: string;
+  reviewOptions?: DeltaReviewOptions;
 }
 
 /** A save commits the entire session atomically before the runner advances. */
@@ -131,4 +139,71 @@ export interface DeltaSessionStore {
 export interface DeltaSubmitBatch {
   batchId: string;
   entries: { paragraphId: string; translation: string }[];
+}
+
+export interface DeltaReviewOptions {
+  enabled: boolean;
+  mode: 'new' | 'append';
+}
+
+export type DeltaChapterContext =
+  | {
+      available: true;
+      chapterId: string;
+      title: string;
+      source: string[];
+      translation?: string[];
+    }
+  | { available: false; reason: string };
+
+export const deltaReviewCategories = [
+  'accuracy',
+  'omission',
+  'fluency',
+  'terminology',
+  'format',
+] as const;
+export const deltaReviewContextOffsets = [-2, -1, 1, 2] as const;
+export type DeltaReviewCategory = (typeof deltaReviewCategories)[number];
+
+export interface DeltaReviewChange {
+  paragraphId: string;
+  translation: string;
+  category: DeltaReviewCategory;
+  reason: string;
+}
+
+export interface DeltaReviewIssue {
+  paragraphId: string;
+  reason: string;
+}
+
+export interface DeltaSubmitReview {
+  reviewId: string;
+  draftHash: string;
+  changes: DeltaReviewChange[];
+  unresolved: DeltaReviewIssue[];
+}
+
+export interface DeltaReviewState {
+  promptVersion?: number;
+  id: string;
+  options: DeltaReviewOptions;
+  draftHash: string;
+  originalTranslations: Record<string, string>;
+  systemPrompt: string;
+  tools: Tool[];
+  messages: Message[];
+  initialMessageCount: number;
+  requests: DeltaRequestRecord[];
+  pendingAssistant?: DeltaChapterSession['pendingAssistant'];
+  attempts: number;
+  failures: number;
+  totalAttempts: number;
+  window: number;
+  contextReads: number;
+  changes?: DeltaReviewChange[];
+  unresolved?: DeltaReviewIssue[];
+  completed: boolean;
+  skipped?: boolean;
 }

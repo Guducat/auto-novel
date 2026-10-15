@@ -13,6 +13,7 @@ const props = defineProps<{
 const emit = defineEmits<{ retry: [workerId: string] }>();
 const phases = {
   translating: '翻译中',
+  reviewing: '审校中',
   readyToSubmit: '待提交',
   submitting: '提交中',
   completed: '已完成',

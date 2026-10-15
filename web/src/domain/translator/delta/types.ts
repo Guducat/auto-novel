@@ -2,6 +2,7 @@ import type {
   DeltaChapterSession,
   DeltaMetadata,
   DeltaSessionStore,
+  DeltaChapterContext,
 } from '@auto-novel/translator';
 import type { ChapterDetail } from '../TranslationTask/types';
 import type { ChapterMeta } from '../TaskState';
@@ -19,6 +20,11 @@ export interface DeltaTaskSource {
   metadata: DeltaMetadata;
   chapters: ChapterMeta[];
   readChapter(chapterId: string): Promise<ChapterDetail>;
+  readChapterContext(
+    chapterId: string,
+    offset: number,
+    signal?: AbortSignal,
+  ): Promise<DeltaChapterContext>;
   uploadChapter(
     chapterId: string,
     glossaryId: string,

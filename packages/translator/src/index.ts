@@ -78,3 +78,20 @@ export type {
   DeltaSessionStore,
   DeltaSubmitBatch,
 } from './delta/types';
+
+export {
+  runDeltaReview,
+  reopenDeltaReviewRetryWindow,
+  skipDeltaReview,
+  normalizeDeltaReviewOptions,
+} from './delta/review-runner';
+export type { RunDeltaReviewOptions } from './delta/review-runner';
+export type {
+  DeltaReviewOptions,
+  DeltaReviewCategory,
+  DeltaReviewState,
+  DeltaChapterContext,
+  DeltaReviewChange,
+  DeltaReviewIssue,
+  DeltaSubmitReview,
+} from './delta/types';

@@ -5,6 +5,10 @@ import {
   deltaChapterKey,
   deltaFingerprint,
   runDeltaChapter,
+  runDeltaReview,
+  reopenDeltaReviewRetryWindow,
+  normalizeDeltaReviewOptions,
+  skipDeltaReview,
   reopenDeltaRetryWindow,
   createPiAiSession,
   DELTA_PROMPT_VERSION,
@@ -36,6 +40,7 @@ interface ControllerOptions {
   ) => void;
   onTaskDone?: (taskId: string, total: number) => void;
   runChapter?: typeof runDeltaChapter;
+  runReview?: typeof runDeltaReview;
 }
 
 interface WorkerRun {
@@ -183,11 +188,39 @@ export class DeltaController {
   retryWorker(worker: GptPipelineWorker): Promise<void> {
     const existing = this.retries.get(worker.id);
     if (existing) return existing.promise;
+    return this.prepareWorker(worker, async (signal) => {
+      const running = this.workers.get(worker.id);
+      running?.controller.abort();
+      await running?.promise;
+      for (const s of this.sessions.values()) {
+        if (signal.aborted) return;
+        if (s.workerId !== worker.id || s.phase === 'completed') continue;
+        const next =
+          s.phase === 'reviewing'
+            ? reopenDeltaReviewRetryWindow(s)
+            : s.phase === 'translating'
+              ? reopenDeltaRetryWindow(s)
+              : structuredClone(s);
+        next.revision = s.revision + 1;
+        await this.save(next);
+      }
+    });
+  }
+
+  private prepareWorker(
+    worker: GptPipelineWorker,
+    prepare: (signal: AbortSignal) => Promise<void>,
+    chapter?: DeltaChapterSession,
+  ): Promise<void> {
     const preparing = {
       controller: new AbortController(),
       promise: Promise.resolve(),
     };
     this.retries.set(worker.id, preparing);
+    if (chapter) {
+      this.claimed.add(chapter.id);
+      this.claimedTasks.set(chapter.id, chapter.identity.taskId);
+    }
     this.options.onWorkerChange?.(
       worker.id,
       true,
@@ -195,15 +228,13 @@ export class DeltaController {
       worker.concurrency,
     );
     preparing.promise = (async () => {
-      const running = this.workers.get(worker.id);
-      running?.controller.abort();
-      await running?.promise;
-      for (const s of this.sessions.values()) {
-        if (preparing.controller.signal.aborted) return;
-        if (s.workerId !== worker.id || s.phase === 'completed') continue;
-        const next = reopenDeltaRetryWindow(s);
-        next.revision = s.revision + 1;
-        await this.save(next);
+      try {
+        await prepare(preparing.controller.signal);
+      } finally {
+        if (chapter) {
+          this.claimed.delete(chapter.id);
+          this.claimedTasks.delete(chapter.id);
+        }
       }
       if (!preparing.controller.signal.aborted) await this.beginWorker(worker);
     })().finally(() => {
@@ -227,6 +258,79 @@ export class DeltaController {
 
   discardNovel(novelId: string): Promise<void> {
     return this.discard((session) => session.identity.novelId === novelId);
+  }
+
+  async skipReview(
+    sessionId: string,
+    worker: GptPipelineWorker,
+  ): Promise<void> {
+    if (this.isRunning(worker.id) || this.claimed.has(sessionId))
+      throw new Error('请先停止该工作，再跳过审校');
+    const session = this.sessions.get(sessionId);
+    if (!session || session.workerId !== worker.id)
+      throw new Error('审校断点或绑定工作不存在');
+    await this.prepareWorker(
+      worker,
+      async (signal) => {
+        await this.validate(
+          session,
+          worker,
+          await this.source(session.identity.taskId),
+        );
+        if (signal.aborted) return;
+        const next = skipDeltaReview(session);
+        next.revision = session.revision + 1;
+        await this.save(next);
+      },
+      session,
+    );
+  }
+
+  async restartChapter(
+    sessionId: string,
+    worker: GptPipelineWorker,
+  ): Promise<void> {
+    if (this.isRunning(worker.id) || this.claimed.has(sessionId))
+      throw new Error('请先停止该工作，再重新翻译');
+    const previous = this.sessions.get(sessionId);
+    if (!previous || previous.workerId !== worker.id)
+      throw new Error('章节断点或绑定工作不存在');
+    await this.prepareWorker(
+      worker,
+      async (signal) => {
+        const src = await this.source(previous.identity.taskId);
+        const current = await src.readChapter(previous.identity.chapterId);
+        if (signal.aborted) return;
+        const session = createDeltaSession({
+          runId: crypto.randomUUID(),
+          workerId: worker.id,
+          identity: {
+            ...previous.identity,
+            taskCreatedAt:
+              this.options
+                .jobs()
+                .find((job) => job.task === previous.identity.taskId)
+                ?.createAt ?? previous.identity.taskCreatedAt,
+          },
+          source: current.paragraphs,
+          glossary: current.glossary,
+          glossaryId: current.glossaryId,
+          metadata: {
+            ...src.metadata,
+            chapterTitle: previous.metadata.chapterTitle,
+          },
+          model: deltaWorkerModel(worker),
+          previousTranslationHash: translationHash(current),
+          reviewOptions: normalizeDeltaReviewOptions(worker.deltaReview),
+        });
+        session.revision = previous.revision + 1;
+        await this.save(session);
+        for (const key of this.done) {
+          if (JSON.parse(key)[0] === sessionId) this.done.delete(key);
+        }
+      },
+      previous,
+    );
   }
 
   private async discard(
@@ -387,6 +491,7 @@ export class DeltaController {
             metadata: { ...src.metadata, chapterTitle: item.title },
             model: deltaWorkerModel(worker),
             previousTranslationHash: translationHash(current),
+            reviewOptions: normalizeDeltaReviewOptions(worker.deltaReview),
           });
           const old = this.sessions.get(session.id);
           if (old) session.revision = old.revision + 1;
@@ -433,11 +538,20 @@ export class DeltaController {
     const current = await src.readChapter(session.identity.chapterId);
     if (
       session.schemaVersion !== 1 ||
-      session.promptVersion !== DELTA_PROMPT_VERSION ||
+      (session.promptVersion !== DELTA_PROMPT_VERSION &&
+        !(
+          session.promptVersion === 3 && session.reviewOptions === undefined
+        )) ||
       deltaFingerprint(deltaWorkerModel(worker)) !==
         deltaFingerprint(session.model)
     )
       throw new Error('模型、协议或提示配置已变化，请保留草稿或放弃后重新启动');
+    if (
+      session.reviewOptions !== undefined &&
+      deltaFingerprint(normalizeDeltaReviewOptions(session.reviewOptions)) !==
+        deltaFingerprint(normalizeDeltaReviewOptions(worker.deltaReview))
+    )
+      throw new Error('审校配置已变化，请保留草稿或放弃后重新启动');
     if (
       deltaFingerprint(current.paragraphs) !== session.sourceHash ||
       current.glossaryId !== session.glossaryId ||
@@ -486,6 +600,45 @@ export class DeltaController {
       // A custom runner and the normal runner share the same pre-submit boundary.
       if (this.sessions.get(session.id)?.revision !== session.revision)
         await this.save(session);
+    }
+    if (
+      session.phase === 'readyToSubmit' &&
+      session.reviewOptions?.enabled &&
+      !session.review?.completed &&
+      !session.review?.skipped
+    )
+      session = await this.patch(session, { phase: 'reviewing' });
+    if (session.phase === 'reviewing') {
+      await this.validate(session, worker, src);
+      if (signal.aborted) {
+        await this.patch(session, { pauseReason: '用户停止' });
+        return;
+      }
+      session = await (this.options.runReview ?? runDeltaReview)(session, {
+        store: { save: async (s) => this.save(s) },
+        transport: createPiAiSession,
+        key: worker.key,
+        signal,
+        readContext: (offset, contextSignal) =>
+          src.readChapterContext(
+            session.identity.chapterId,
+            offset,
+            contextSignal,
+          ),
+      });
+      if (this.sessions.get(session.id)?.revision !== session.revision)
+        await this.save(session);
+      if (session.pauseReason || session.phase !== 'readyToSubmit') {
+        this.options.onChapterChange?.(
+          session.identity.taskId,
+          session.identity.chapterId,
+          signal.aborted || session.pauseReason?.includes('停止')
+            ? 'pending'
+            : 'paused',
+          session,
+        );
+        return;
+      }
     }
     if (signal.aborted && session.phase !== 'submitting') {
       await this.patch(session, { pauseReason: '用户停止' });
@@ -577,8 +730,19 @@ export class DeltaController {
               ),
             ),
         )
-      )
-        this.options.onTaskDone?.(job.task, src.chapters.length);
+      ) {
+        const chapterIds = new Set(
+          src.chapters.map((chapter) => chapter.chapterId),
+        );
+        for (const session of this.sessions.values()) {
+          if (
+            session.identity.taskId === job.task &&
+            session.identity.taskCreatedAt === job.createAt
+          )
+            chapterIds.add(session.identity.chapterId);
+        }
+        this.options.onTaskDone?.(job.task, chapterIds.size);
+      }
     }
     if (failure) throw failure;
   }

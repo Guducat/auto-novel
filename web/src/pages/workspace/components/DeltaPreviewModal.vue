@@ -1,5 +1,8 @@
 <script lang="ts" setup>
-import type { DeltaChapterSession } from '@auto-novel/translator';
+import type {
+  DeltaChapterSession,
+  DeltaUsagePresence,
+} from '@auto-novel/translator';
 
 const themeVars = useThemeVars();
 
@@ -7,17 +10,22 @@ const props = defineProps<{
   show: boolean;
   title: string;
   session: DeltaChapterSession | null;
+  actionsDisabled?: boolean;
 }>();
 
 const emit = defineEmits<{
   (e: 'update:show', val: boolean): void;
+  (e: 'skipReview', sessionId: string): void;
+  (e: 'restartDelta', sessionId: string): void;
 }>();
 
 // -1 = 全章, 0..N-1 = 具体批次
 const selectedBatchIndex = ref(-1);
 const visibleBatch = computed(() => {
   const s = props.session;
-  return s?.batches[selectedBatchIndex.value < 0 ? s.cursor : selectedBatchIndex.value];
+  return s?.batches[
+    selectedBatchIndex.value < 0 ? s.cursor : selectedBatchIndex.value
+  ];
 });
 const includesBatchHistory = (batchId: string, requestBatchId: string) =>
   batchId === requestBatchId || batchId.startsWith(`${requestBatchId}.`);
@@ -164,7 +172,9 @@ const activeMetrics = computed(() => {
   if (selectedBatchIndex.value >= 0) {
     const batch = s.batches[selectedBatchIndex.value];
     if (batch) {
-      targetRequests = requests.filter((r) => includesBatchHistory(batch.id, r.batchId));
+      targetRequests = requests.filter((r) =>
+        includesBatchHistory(batch.id, r.batchId),
+      );
       isBatch = true;
     }
   }
@@ -211,7 +221,9 @@ const batchAttemptInfo = computed(() => {
   } else {
     const batch = s.batches[selectedBatchIndex.value];
     if (!batch) return null;
-    const reqs = (s.requests ?? []).filter((r) => includesBatchHistory(batch.id, r.batchId));
+    const reqs = (s.requests ?? []).filter((r) =>
+      includesBatchHistory(batch.id, r.batchId),
+    );
     const count = reqs.length;
     const last = reqs[reqs.length - 1];
     const isOnePass = count === 1 && last?.status === 'accepted';
@@ -239,11 +251,13 @@ const displayParagraphs = computed(() => {
     activeParagraphs = allParagraphs.filter((p) => idSet.has(p.id));
   }
 
-  const currentBatchParaIds = new Set(
-    batches[s.cursor]?.paragraphIds ?? [],
-  );
+  const currentBatchParaIds = new Set(batches[s.cursor]?.paragraphIds ?? []);
 
-  const list: { jp: string; zh: string; status: 'done' | 'translating' | 'pending' | 'error' }[] = [];
+  const list: {
+    jp: string;
+    zh: string;
+    status: 'done' | 'translating' | 'pending' | 'error';
+  }[] = [];
   for (let idx = 0; idx < activeParagraphs.length; idx++) {
     const p = activeParagraphs[idx];
     if (p.empty) {
@@ -268,7 +282,9 @@ const displayParagraphs = computed(() => {
   return list;
 });
 
-const batchBtnType = (index: number): 'default' | 'success' | 'warning' | 'error' | 'info' => {
+const batchBtnType = (
+  index: number,
+): 'default' | 'success' | 'warning' | 'error' | 'info' => {
   const s = props.session;
   if (!s) return 'default';
   if (s.phase === 'completed') return 'success';
@@ -281,8 +297,74 @@ const doneCount = computed(() => {
   return props.session ? Object.keys(props.session.translations).length : 0;
 });
 const totalCount = computed(() => {
-  return props.session ? props.session.paragraphs.filter((p) => !p.empty).length : 0;
+  return props.session
+    ? props.session.paragraphs.filter((p) => !p.empty).length
+    : 0;
 });
+
+const reviewThinking = computed(() => {
+  const review = props.session?.review;
+  return (review?.messages.slice(review.initialMessageCount) ?? [])
+    .flatMap((message) =>
+      message.role === 'assistant'
+        ? message.content.flatMap((block) =>
+            block.type === 'thinking' && block.thinking ? [block.thinking] : [],
+          )
+        : [],
+    )
+    .join('\n\n');
+});
+
+const reviewMetrics = computed(() => {
+  const requests = props.session?.review?.requests ?? [];
+  const metrics: { key: keyof DeltaUsagePresence; label: string }[] = [
+    { key: 'input', label: '非缓存输入' },
+    { key: 'cacheRead', label: '缓存输入' },
+    { key: 'cacheWrite', label: '缓存写入' },
+    { key: 'output', label: '输出' },
+  ];
+  return metrics.map(({ key, label }) => {
+    const reported = requests.filter(
+      (request) => request.usagePresence?.[key] && request.usage,
+    );
+    const total = reported.reduce(
+      (sum, request) => sum + request.usage![key],
+      0,
+    );
+    const value = reported.length ? total.toLocaleString() : '未返回';
+    return {
+      key,
+      label,
+      value: `${value}（覆盖 ${reported.length}/${requests.length} 请求）`,
+    };
+  });
+});
+
+const reviewSummary = computed(() => {
+  const review = props.session?.review;
+  if (!review) return '未开启';
+  if (review.skipped) return '已跳过';
+  const unresolved = review.unresolved?.length ?? 0;
+  if (unresolved) return `未解决 ${unresolved} 项`;
+  if (review.completed)
+    return `已完成 · 修改 ${review.changes?.length ?? 0} 段`;
+  return props.session?.pauseReason ? '已暂停' : '审校中';
+});
+
+const canSkipReview = computed(
+  () =>
+    !props.actionsDisabled &&
+    props.session?.phase === 'reviewing' &&
+    !!props.session.pauseReason,
+);
+function skipReview() {
+  if (canSkipReview.value && props.session)
+    emit('skipReview', props.session.id);
+}
+function restartDelta() {
+  if (!props.actionsDisabled && props.session)
+    emit('restartDelta', props.session.id);
+}
 </script>
 
 <template>
@@ -313,6 +395,14 @@ const totalCount = computed(() => {
             ● 第 {{ session.cursor + 1 }}/{{ session.batches.length }} 批进行中
           </n-tag>
           <n-tag
+            v-else-if="session.phase === 'reviewing'"
+            size="small"
+            :bordered="false"
+            type="info"
+          >
+            审校中
+          </n-tag>
+          <n-tag
             v-else-if="session.phase === 'completed'"
             size="small"
             :bordered="false"
@@ -338,9 +428,7 @@ const totalCount = computed(() => {
       <div class="delta-meta-container">
         <!-- 第 1 行：翻译器信息 + 一次通过 / 重试 / 拆分状态胶囊 -->
         <n-flex :size="8" align="center" class="delta-meta-row">
-          <n-text depth="3" class="delta-meta-label">
-            翻译器：
-          </n-text>
+          <n-text depth="3" class="delta-meta-label">翻译器：</n-text>
           <n-text class="delta-meta-value">
             {{ session.model.model }} · {{ session.model.protocol }}
           </n-text>
@@ -368,15 +456,23 @@ const totalCount = computed(() => {
                     type="warning"
                     style="cursor: pointer"
                   >
-                    重试 {{ batchAttemptInfo.requestCount - 1 }} 次 (共 {{ batchAttemptInfo.requestCount }} 次请求)
+                    重试 {{ batchAttemptInfo.requestCount - 1 }} 次 (共
+                    {{ batchAttemptInfo.requestCount }} 次请求)
                   </n-tag>
                 </template>
                 <div style="font-size: 12px; max-width: 380px; padding: 2px">
-                  <div style="font-weight: 500; margin-bottom: 6px">请求记录明细</div>
+                  <div style="font-weight: 500; margin-bottom: 6px">
+                    请求记录明细
+                  </div>
                   <div
                     v-for="(r, idx) in batchAttemptInfo.requests"
                     :key="r.requestId"
-                    style="display: flex; gap: 8px; align-items: center; margin-top: 4px"
+                    style="
+                      display: flex;
+                      gap: 8px;
+                      align-items: center;
+                      margin-top: 4px;
+                    "
                   >
                     <n-tag
                       size="tiny"
@@ -385,8 +481,19 @@ const totalCount = computed(() => {
                     >
                       {{ r.batchId }} · 尝试 {{ idx + 1 }}
                     </n-tag>
-                    <span :style="{ color: r.status === 'accepted' ? undefined : themeVars.errorColor }">
-                      {{ r.status === 'accepted' ? '✓ 校验通过' : (r.error || r.status) }}
+                    <span
+                      :style="{
+                        color:
+                          r.status === 'accepted'
+                            ? undefined
+                            : themeVars.errorColor,
+                      }"
+                    >
+                      {{
+                        r.status === 'accepted'
+                          ? '✓ 校验通过'
+                          : r.error || r.status
+                      }}
                     </span>
                   </div>
                 </div>
@@ -402,7 +509,10 @@ const totalCount = computed(() => {
             </template>
             <template v-else>
               <n-tag
-                v-if="batchAttemptInfo.retryBatchCount === 0 && batchAttemptInfo.onePassCount > 0"
+                v-if="
+                  batchAttemptInfo.retryBatchCount === 0 &&
+                  batchAttemptInfo.onePassCount > 0
+                "
                 size="tiny"
                 :bordered="false"
                 type="success"
@@ -415,7 +525,9 @@ const totalCount = computed(() => {
                 :bordered="false"
                 type="warning"
               >
-                {{ batchAttemptInfo.retryBatchCount }} 批存在重试 ({{ batchAttemptInfo.retryBatchIds.join('、') }})
+                {{ batchAttemptInfo.retryBatchCount }} 批存在重试 ({{
+                  batchAttemptInfo.retryBatchIds.join('、')
+                }})
               </n-tag>
             </template>
           </template>
@@ -424,7 +536,7 @@ const totalCount = computed(() => {
         <!-- 第 2 行：批次Token指标 (非缓存输入 xxxx 缓存输入 xxxx 输出 xxxx) -->
         <n-flex :size="8" align="center" class="delta-meta-row">
           <n-text depth="3" class="delta-meta-label">
-            {{ metricsLabel }}：
+            初译 {{ metricsLabel }}：
           </n-text>
           <n-tag size="tiny" :bordered="false">
             非缓存输入 {{ activeMetrics.input.toLocaleString() }}
@@ -480,7 +592,7 @@ const totalCount = computed(() => {
       <n-alert
         v-if="session.pauseReason"
         type="warning"
-        title="翻译暂停"
+        :title="session.phase === 'reviewing' ? '审校暂停' : '翻译暂停'"
         :bordered="false"
         style="margin-bottom: 8px"
       >
@@ -489,10 +601,91 @@ const totalCount = computed(() => {
 
       <!-- 思考过程 (无 AI 推理 badge，按批次或全章独立呈现) -->
       <n-collapse v-if="currentThinking" class="delta-thinking-collapse">
-        <n-collapse-item title="思考过程" name="thinking">
+        <n-collapse-item title="初译思考 / 摘要" name="thinking">
           <div class="delta-thinking-content">{{ currentThinking }}</div>
         </n-collapse-item>
       </n-collapse>
+
+      <n-card v-if="session.review" size="small" style="margin-bottom: 12px">
+        <template #header>章末 Review · {{ reviewSummary }}</template>
+        <n-flex vertical :size="8">
+          <n-text depth="3" style="font-size: 12px">
+            {{
+              session.review.options.mode === 'append'
+                ? '追加原会话'
+                : '新开会话'
+            }}
+            · 已请求 {{ session.review.totalAttempts }} 次 · 重试窗口
+            {{ session.review.window }}
+          </n-text>
+          <n-flex :size="6">
+            <n-tag
+              v-for="metric of reviewMetrics"
+              :key="metric.key"
+              size="small"
+              :bordered="false"
+            >
+              审校 {{ metric.label }} {{ metric.value }}
+            </n-tag>
+          </n-flex>
+          <n-alert
+            v-if="session.review.unresolved?.length"
+            type="warning"
+            :show-icon="false"
+          >
+            <n-flex vertical :size="4">
+              <n-text>未解决 {{ session.review.unresolved.length }} 项</n-text>
+              <n-text
+                v-for="finding of session.review.unresolved"
+                :key="finding.paragraphId"
+                style="overflow-wrap: anywhere"
+              >
+                {{ finding.paragraphId }}：{{ finding.reason }}
+              </n-text>
+            </n-flex>
+          </n-alert>
+          <n-collapse v-if="reviewThinking || session.review.changes?.length">
+            <n-collapse-item
+              v-if="reviewThinking"
+              title="审校思考 / 摘要"
+              name="review-thinking"
+            >
+              <div class="delta-thinking-content">{{ reviewThinking }}</div>
+            </n-collapse-item>
+            <n-collapse-item
+              v-if="session.review.changes?.length"
+              :title="`修改 ${session.review.changes.length} 段`"
+              name="review-changes"
+            >
+              <n-flex vertical :size="12">
+                <div
+                  v-for="change of session.review.changes"
+                  :key="change.paragraphId"
+                  style="overflow-wrap: anywhere"
+                >
+                  <n-text strong>
+                    {{ change.paragraphId }} · {{ change.category }}
+                  </n-text>
+                  <div>
+                    <n-text depth="3">原译：</n-text>
+                    {{
+                      session.review.originalTranslations[change.paragraphId]
+                    }}
+                  </div>
+                  <div>
+                    <n-text depth="3">审校：</n-text>
+                    {{ change.translation }}
+                  </div>
+                  <div>
+                    <n-text depth="3">原因：</n-text>
+                    {{ change.reason }}
+                  </div>
+                </div>
+              </n-flex>
+            </n-collapse-item>
+          </n-collapse>
+        </n-flex>
+      </n-card>
 
       <!-- 原文 vs 译文 双语对照表格 -->
       <n-table :bordered="false" size="small" class="delta-preview-table">
@@ -519,6 +712,21 @@ const totalCount = computed(() => {
         </tbody>
       </n-table>
     </div>
+    <template v-if="session" #action>
+      <n-flex :size="8">
+        <c-button
+          v-if="session.phase === 'reviewing' && session.pauseReason"
+          label="跳过本章审校"
+          :disabled="!canSkipReview"
+          @action="skipReview"
+        />
+        <c-button
+          label="本章重新翻译"
+          :disabled="actionsDisabled"
+          @action="restartDelta"
+        />
+      </n-flex>
+    </template>
   </c-modal>
 </template>
 

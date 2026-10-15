@@ -24,6 +24,7 @@ const props = defineProps<{
   taskState?: TaskState;
   taskCacheEntry?: TranslationTask;
   deltaSessions?: DeltaChapterSession[];
+  deltaActionsDisabled?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -32,6 +33,8 @@ const emit = defineEmits<{
   bottom: [task: string];
   retry: [task: string];
   retryDelta: [task: string];
+  skipReview: [sessionId: string];
+  restartDelta: [sessionId: string];
 }>();
 
 const taskDeltaSessions = computed(() => {
@@ -47,6 +50,7 @@ const deltaActiveCount = computed(
     taskDeltaSessions.value.filter(
       (s) =>
         s.phase === 'translating' ||
+        s.phase === 'reviewing' ||
         s.phase === 'submitting' ||
         s.phase === 'readyToSubmit',
     ).length,
@@ -146,9 +150,7 @@ function createTask(taskDesc: string): TranslationTask {
   return createTranslationTask(desc, props.translatorId, params);
 }
 
-const totalChaptersCount = computed(
-  () => chapterMetas.value.length || 0,
-);
+const totalChaptersCount = computed(() => chapterMetas.value.length || 0);
 
 const showDeltaPreview = ref(false);
 const showPipelinePreview = ref(false);
@@ -244,7 +246,9 @@ const openPreview = async (chapterId: string) => {
               :type="deltaActiveCount > 0 ? 'info' : 'primary'"
               class="delta-badge"
             >
-              Delta{{ deltaActiveCount > 0 ? ` · ${deltaActiveCount} 进行中` : '' }}
+              Delta{{
+                deltaActiveCount > 0 ? ` · ${deltaActiveCount} 进行中` : ''
+              }}
             </n-tag>
             <n-tag v-if="taskStatus === 'executing'" size="tiny" type="info">
               翻译中
@@ -361,7 +365,8 @@ const openPreview = async (chapterId: string) => {
           </n-flex>
           <n-flex align="center" :size="6">
             <n-text depth="3" class="delta-strip-metric">
-              读取缓存: {{ deltaTotalCacheRead.toLocaleString() }} · 输出: {{ deltaTotalOutput.toLocaleString() }}
+              读取缓存: {{ deltaTotalCacheRead.toLocaleString() }} · 输出:
+              {{ deltaTotalOutput.toLocaleString() }}
             </n-text>
             <c-button
               v-if="deltaPausedCount"
@@ -386,7 +391,10 @@ const openPreview = async (chapterId: string) => {
     :show="showDeltaPreview"
     :title="previewTitle"
     :session="activeDeltaSession"
+    :actions-disabled="deltaActionsDisabled"
     @update:show="(v: boolean) => (showDeltaPreview = v)"
+    @skip-review="(sessionId: string) => emit('skipReview', sessionId)"
+    @restart-delta="(sessionId: string) => emit('restartDelta', sessionId)"
   />
 
   <chapter-preview-modal

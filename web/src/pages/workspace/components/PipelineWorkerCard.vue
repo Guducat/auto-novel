@@ -111,7 +111,7 @@ const testWorker = async () => {
           :bordered="false"
           class="viz-paused-tag"
         >
-          ⏸ {{ pausedCount }} 暂停
+          暂停 {{ pausedCount }}
         </n-tag>
       </span>
     </template>

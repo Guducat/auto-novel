@@ -12,6 +12,7 @@ import {
   DELTA_PROMPT_VERSION,
   deltaSubmitBatchTool,
 } from './prompt';
+import { deltaReviewTools } from './review-prompt';
 import type { PiAiSessionRequest, PiAiSessionResult } from './pi-ai-transport';
 import type {
   CreateDeltaSessionInput,
@@ -69,8 +70,17 @@ export function createDeltaSession(
     batches,
     cursor: 0,
     translations: {},
-    systemPrompt: buildDeltaSystemPrompt(metadata, preferences),
-    tools: [structuredClone(deltaSubmitBatchTool)],
+    systemPrompt: buildDeltaSystemPrompt(
+      metadata,
+      preferences,
+      frozen.reviewOptions,
+    ),
+    reviewOptions: frozen.reviewOptions,
+    tools: structuredClone(
+      frozen.reviewOptions?.enabled && frozen.reviewOptions.mode === 'append'
+        ? [deltaSubmitBatchTool, ...deltaReviewTools]
+        : [deltaSubmitBatchTool],
+    ),
     messages: [],
     promptCursor: -1,
     requests: [],
@@ -128,7 +138,10 @@ export interface RunDeltaChapterOptions {
 function finish(session: DeltaChapterSession) {
   session.finalParagraphs = assembleDeltaChapter(session);
   session.finalHash = deltaFingerprint(session.finalParagraphs);
-  session.phase = 'readyToSubmit';
+  session.phase =
+    session.reviewOptions?.enabled && session.batches.length
+      ? 'reviewing'
+      : 'readyToSubmit';
   session.pauseReason = undefined;
 }
 
@@ -415,7 +428,7 @@ export async function runDeltaChapter(
   return session;
 }
 
-function retryWait(ms: number, signal?: AbortSignal): Promise<void> {
+export function retryWait(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
       reject(new DOMException('Stopped', 'AbortError'));

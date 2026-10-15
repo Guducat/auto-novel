@@ -6,6 +6,7 @@ import type { GptPipelineWorker } from '@/model/Translator';
 import { useGptPipelineWorkspaceStore } from '@/stores';
 import {
   openAiProfiles,
+  type DeltaReviewOptions,
   type openAiProfileId,
   type ProfileValues,
 } from '@auto-novel/translator';
@@ -50,9 +51,14 @@ const initFormValue = (
   concurrency: number;
   profileId: openAiProfileId;
   profileValues: ProfileValues;
+  deltaReview: DeltaReviewOptions;
 } => {
   const profileId = worker?.profile?.id ?? DEFAULT_PROFILE_ID;
   const defaultValues = defaultProfileValues(profileId);
+  const deltaReview: DeltaReviewOptions = {
+    enabled: worker?.deltaReview?.enabled ?? false,
+    mode: worker?.deltaReview?.mode ?? 'new',
+  };
 
   if (worker === undefined) {
     return {
@@ -63,6 +69,7 @@ const initFormValue = (
       concurrency: 1,
       profileId,
       profileValues: defaultValues,
+      deltaReview,
     };
   } else {
     return {
@@ -76,6 +83,7 @@ const initFormValue = (
         ...defaultValues,
         ...(worker.profile?.values ?? {}),
       },
+      deltaReview,
     };
   }
 };
@@ -360,6 +368,7 @@ const addWorkers = () => {
       key: w.key,
       concurrency: workerConcurrencies[w.id] ?? defaultConcurrency.value,
       profile,
+      deltaReview: { ...formValue.value.deltaReview },
     });
   }
 };
@@ -389,6 +398,7 @@ const submit = async () => {
         id: profileId,
         values: { ...profileValues },
       },
+      deltaReview: { ...formValue.value.deltaReview },
     };
     const index = workspaceRef.value.workers.findIndex(
       (w) => w.id === props.worker?.id,
@@ -560,6 +570,34 @@ const verb = computed(() => (props.worker === undefined ? '添加' : '更新'));
           />
         </n-form-item-row>
       </template>
+      <n-collapse style="margin-bottom: 16px">
+        <n-collapse-item title="(实验性) Delta Review" name="delta-review">
+          <n-flex vertical :size="12">
+            <n-text depth="3" style="font-size: 12px">
+              仅适用于Delta翻译，全章初译完成后，大模型进行二审后再提交。
+            </n-text>
+            <n-flex align="center" :size="8">
+              <n-switch
+                v-model:value="formValue.deltaReview.enabled"
+                aria-label="开启章末 Review"
+              />
+              <n-text>开启(注意！消耗更多token！)</n-text>
+            </n-flex>
+            <n-form-item-row
+              v-if="formValue.deltaReview.enabled"
+              label="会话方式"
+              :show-feedback="false"
+            >
+              <n-radio-group v-model:value="formValue.deltaReview.mode">
+                <n-flex :size="12">
+                  <n-radio value="new">独立会话（默认）</n-radio>
+                  <n-radio value="append">追加到原会话</n-radio>
+                </n-flex>
+              </n-radio-group>
+            </n-form-item-row>
+          </n-flex>
+        </n-collapse-item>
+      </n-collapse>
     </n-form>
 
     <template #action>
