@@ -9,7 +9,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   discardChapter: [sessionId: string];
   discardNovel: [novelId: string];
-  discardAll: [];
+  discardPending: [];
 }>();
 const show = ref(false);
 const novels = computed(() => {
@@ -56,23 +56,29 @@ const novels = computed(() => {
       <n-flex
         justify="space-between"
         align="center"
+        :wrap="false"
         style="margin-bottom: 12px; padding: 0 4px"
       >
-        <n-text depth="3" style="font-size: 13px">
+        <n-text
+          depth="3"
+          style="
+            min-width: 0;
+            flex: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            font-size: 13px;
+          "
+        >
           共 {{ novels.length }} 部小说 · {{ sessions.length }} 个章节
         </n-text>
-        <n-popconfirm @positive-click="emit('discardAll')">
+        <n-popconfirm @positive-click="emit('discardPending')">
           <template #trigger>
-            <n-button
-              size="tiny"
-              type="error"
-              secondary
-              :disabled="disabled"
-            >
-              清空全部数据
+            <n-button size="tiny" type="warning" secondary :disabled="disabled">
+              清空任务缓存
             </n-button>
           </template>
-          确定要清空全部未完成的 Delta 数据与断点记录吗？清空后将从头重新翻译。
+          确认清空翻译缓存并清理未完成的翻译任务？
         </n-popconfirm>
       </n-flex>
 
@@ -83,8 +89,31 @@ const novels = computed(() => {
           :name="novel.id"
         >
           <template #header>
-            <n-flex align="center" :size="8">
-              <span>{{ novel.title }}</span>
+            <n-flex
+              align="center"
+              :size="8"
+              :wrap="false"
+              style="min-width: 0; flex: 1"
+            >
+              <span
+                style="
+                  display: -webkit-box;
+                  min-width: 0;
+                  flex: 1;
+                  overflow: hidden;
+                  text-overflow: ellipsis;
+                  white-space: normal;
+                  overflow-wrap: anywhere;
+                  -webkit-box-orient: vertical;
+                  -webkit-line-clamp: 2;
+                "
+              >
+                {{ novel.title }}
+              </span>
+            </n-flex>
+          </template>
+          <template #header-extra>
+            <n-flex align="center" :size="8" :wrap="false">
               <n-tag
                 size="tiny"
                 :bordered="false"
@@ -93,42 +122,55 @@ const novels = computed(() => {
               >
                 {{ novel.completedCount }}/{{ novel.totalCount }}
               </n-tag>
+              <n-popconfirm @positive-click="emit('discardNovel', novel.id)">
+                <template #trigger>
+                  <n-button
+                    size="tiny"
+                    type="error"
+                    secondary
+                    :disabled="disabled"
+                    @click.stop
+                  >
+                    清空全书
+                  </n-button>
+                </template>
+                确定要清空《{{ novel.title }}》的全部 Delta 数据吗？
+              </n-popconfirm>
             </n-flex>
-          </template>
-          <template #header-extra>
-            <n-popconfirm @positive-click="emit('discardNovel', novel.id)">
-              <template #trigger>
-                <n-button
-                  size="tiny"
-                  type="error"
-                  secondary
-                  :disabled="disabled"
-                  @click.stop
-                >
-                  清空全书
-                </n-button>
-              </template>
-              确定要清空《{{ novel.title }}》的全部 Delta 数据吗？
-            </n-popconfirm>
           </template>
           <n-list hoverable>
             <n-list-item v-for="session in novel.chapters" :key="session.id">
-              <n-flex justify="space-between" align="center" style="width: 100%">
+              <n-flex
+                justify="space-between"
+                align="center"
+                style="width: 100%"
+              >
                 <div>
-                  <span>{{
-                    session.metadata.chapterTitle ||
-                    session.identity.title ||
-                    session.identity.chapterId
-                  }}</span>
+                  <span>
+                    {{
+                      session.metadata.chapterTitle ||
+                      session.identity.title ||
+                      session.identity.chapterId
+                    }}
+                  </span>
                   <n-text depth="3" style="font-size: 12px; margin-left: 8px">
-                    ({{ session.cursor }}/{{ session.batches.length }} 批 · {{ session.pauseReason ? '已暂停' : session.phase === 'completed' ? '已完成' : '进行中' }})
+                    ({{ session.cursor }}/{{ session.batches.length }} 批 ·
+                    {{
+                      session.pauseReason
+                        ? '已暂停'
+                        : session.phase === 'completed'
+                          ? '已完成'
+                          : '进行中'
+                    }})
                   </n-text>
                 </div>
-                <n-popconfirm @positive-click="emit('discardChapter', session.id)">
+                <n-popconfirm
+                  @positive-click="emit('discardChapter', session.id)"
+                >
                   <template #trigger>
                     <n-button
                       size="tiny"
-                      type="error"
+                      type="warning"
                       secondary
                       :disabled="disabled"
                     >
@@ -145,3 +187,13 @@ const novels = computed(() => {
     </template>
   </c-modal>
 </template>
+
+<style scoped>
+:deep(.n-collapse-item__header-main) {
+  min-width: 0;
+}
+
+:deep(.n-collapse-item__header-extra) {
+  flex-shrink: 0;
+}
+</style>

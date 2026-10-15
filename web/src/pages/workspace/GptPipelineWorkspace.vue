@@ -691,58 +691,8 @@ function canResumeDelta(workerId: string) {
     (session) => session.workerId === workerId && session.phase !== 'completed',
   );
 }
-async function discardDelta() {
-  if (
-    !delta ||
-    !workspaceExecution ||
-    deltaBusy.value ||
-    hasRunningWorker() ||
-    pipelineDraining.value
-  )
-    return;
-  maintainingCheckpoints.value = true;
-  try {
-    const maintained = await workspaceExecution.runMaintenance(
-      'delta',
-      async () => {
-        await deltaReady;
-        await delta.load();
-        const before = [...deltaSessions.value];
-        try {
-          await Toast.promise(delta.clear(), {
-            success: 'Delta 数据清空成功',
-            error: 'Delta 数据清空失败',
-          });
-        } finally {
-          for (const session of before) {
-            const chapter = taskStates.value
-              .get(session.identity.taskId)
-              ?.chapters.find(
-                (ch) => ch.chapterId === session.identity.chapterId,
-              );
-            if (chapter) {
-              chapter.segmentProgress = undefined;
-              if (
-                chapter.status === 'translating' ||
-                chapter.status === 'paused'
-              ) {
-                chapter.status = 'pending';
-              }
-            }
-          }
-        }
-      },
-    );
-    if (!maintained)
-      Toast.warning('工作区正在运行或启动，请停止并等待完成后清空数据');
-  } finally {
-    checkpointRefresh = undefined;
-    maintainingCheckpoints.value = false;
-  }
-}
-
 async function discardDeltaScope(
-  scope: { sessionId: string } | { novelId: string },
+  scope: { sessionId: string } | { novelId: string } | { pending: true },
 ) {
   if (
     !delta ||
@@ -763,7 +713,10 @@ async function discardDeltaScope(
           try {
             if ('sessionId' in scope)
               await delta.discardChapter(scope.sessionId);
-            else await delta.discardNovel(scope.novelId);
+            else if ('novelId' in scope)
+              await delta.discardNovel(scope.novelId);
+            else await delta.discardPending();
+            await delta.load();
           } finally {
             const remaining = new Set(deltaSessions.value.map((s) => s.id));
             for (const session of before) {
@@ -1001,7 +954,7 @@ watch(
               :disabled="deltaBusy || pipelineDraining || hasRunningWorker()"
               @discard-chapter="discardDeltaScope({ sessionId: $event })"
               @discard-novel="discardDeltaScope({ novelId: $event })"
-              @discard-all="discardDelta"
+              @discard-pending="discardDeltaScope({ pending: true })"
             />
           </n-button-group>
         </c-action-wrapper>

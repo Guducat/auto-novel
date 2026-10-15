@@ -2,6 +2,8 @@
 import type {
   DeltaChapterSession,
   DeltaUsagePresence,
+  DeltaChapterContext,
+  DeltaReviewCategory,
 } from '@auto-novel/translator';
 
 const themeVars = useThemeVars();
@@ -254,6 +256,7 @@ const displayParagraphs = computed(() => {
   const currentBatchParaIds = new Set(batches[s.cursor]?.paragraphIds ?? []);
 
   const list: {
+    id: string;
     jp: string;
     zh: string;
     status: 'done' | 'translating' | 'pending' | 'error';
@@ -261,7 +264,7 @@ const displayParagraphs = computed(() => {
   for (let idx = 0; idx < activeParagraphs.length; idx++) {
     const p = activeParagraphs[idx];
     if (p.empty) {
-      list.push({ jp: '', zh: '', status: 'pending' });
+      list.push({ id: p.id, jp: '', zh: '', status: 'pending' });
       continue;
     }
     const zh =
@@ -277,7 +280,7 @@ const displayParagraphs = computed(() => {
       status = s.pauseReason ? 'error' : 'translating';
     }
 
-    list.push({ jp: p.source, zh, status });
+    list.push({ id: p.id, jp: p.source, zh, status });
   }
   return list;
 });
@@ -365,6 +368,389 @@ function restartDelta() {
   if (!props.actionsDisabled && props.session)
     emit('restartDelta', props.session.id);
 }
+
+// --- 审校样式与交互增强 ---
+const highlightedParaId = ref<string | null>(null);
+let highlightTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scrollToParagraph(paraId: string) {
+  const s = props.session;
+  if (s && selectedBatchIndex.value >= 0) {
+    const currentBatch = s.batches[selectedBatchIndex.value];
+    if (currentBatch && !currentBatch.paragraphIds.includes(paraId)) {
+      selectedBatchIndex.value = -1;
+    }
+  }
+
+  nextTick(() => {
+    highlightedParaId.value = paraId;
+    if (highlightTimer) clearTimeout(highlightTimer);
+    highlightTimer = setTimeout(() => {
+      highlightedParaId.value = null;
+    }, 2500);
+
+    const el = document.getElementById(`delta-para-${paraId}`);
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+  });
+}
+
+function computeTextDiff(original: string, updated: string) {
+  if (!original || !updated || original === updated) {
+    return {
+      prefix: original || updated || '',
+      origDiff: '',
+      newDiff: '',
+      suffix: '',
+    };
+  }
+  let start = 0;
+  while (
+    start < original.length &&
+    start < updated.length &&
+    original[start] === updated[start]
+  ) {
+    start++;
+  }
+  let origEnd = original.length;
+  let newEnd = updated.length;
+  while (
+    origEnd > start &&
+    newEnd > start &&
+    original[origEnd - 1] === updated[newEnd - 1]
+  ) {
+    origEnd--;
+    newEnd--;
+  }
+  return {
+    prefix: original.slice(0, start),
+    origDiff: original.slice(start, origEnd),
+    newDiff: updated.slice(start, newEnd),
+    suffix: original.slice(origEnd),
+  };
+}
+
+const reviewCategoryMap: Record<
+  DeltaReviewCategory,
+  {
+    label: string;
+    type: 'info' | 'warning' | 'success' | 'primary' | 'default';
+  }
+> = {
+  terminology: { label: '术语一致', type: 'primary' },
+  accuracy: { label: '准确性', type: 'info' },
+  fluency: { label: '润色通顺', type: 'success' },
+  omission: { label: '补全漏译', type: 'warning' },
+  format: { label: '格式排版', type: 'default' },
+};
+
+function getCategoryInfo(category: string) {
+  return (
+    reviewCategoryMap[category as DeltaReviewCategory] ?? {
+      label: category,
+      type: 'default' as const,
+    }
+  );
+}
+
+const computedReviewChanges = computed(() => {
+  const review = props.session?.review;
+  if (!review?.changes) return [];
+  const origMap = review.originalTranslations ?? {};
+  return review.changes.map((change) => {
+    const originalText = origMap[change.paragraphId] ?? '';
+    const diff = computeTextDiff(originalText, change.translation);
+    const cat = getCategoryInfo(change.category);
+    return {
+      ...change,
+      originalText,
+      diff,
+      categoryLabel: cat.label,
+      categoryType: cat.type,
+    };
+  });
+});
+
+const reviewStatusBadge = computed(() => {
+  const review = props.session?.review;
+  if (!review)
+    return { text: '未开启', type: 'default' as const, spinning: false };
+  if (review.skipped)
+    return { text: '已跳过', type: 'default' as const, spinning: false };
+  if (props.session?.pauseReason)
+    return { text: '审校暂停', type: 'error' as const, spinning: false };
+  if (review.completed) {
+    const changesCount = review.changes?.length ?? 0;
+    const unresolvedCount = review.unresolved?.length ?? 0;
+    if (unresolvedCount > 0) {
+      return {
+        text: `已完成 · 待确认 ${unresolvedCount} 项`,
+        type: 'warning' as const,
+        spinning: false,
+      };
+    }
+    if (changesCount > 0) {
+      return {
+        text: `已完成 · 修改 ${changesCount} 段`,
+        type: 'success' as const,
+        spinning: false,
+      };
+    }
+    return {
+      text: '已完成 · 原文无需修改',
+      type: 'success' as const,
+      spinning: false,
+    };
+  }
+  return {
+    text: '审校中',
+    type: 'info' as const,
+    spinning: true,
+  };
+});
+
+const formattedReviewMetrics = computed(() => {
+  const requests = props.session?.review?.requests ?? [];
+  return reviewMetrics.value.map((m) => {
+    const key = m.key as keyof DeltaUsagePresence;
+    const reported = requests.filter((r) => r.usagePresence?.[key] && r.usage);
+    const total = reported.reduce((sum, r) => sum + r.usage![key], 0);
+    const hasValue = reported.length > 0;
+    let tagType: 'default' | 'success' | 'info' = 'default';
+    if (key === 'cacheRead' && total > 0) tagType = 'success';
+    else if (key === 'output' && total > 0) tagType = 'info';
+
+    return {
+      ...m,
+      displayValue: hasValue ? total.toLocaleString() : '-',
+      coverageText: `覆盖 ${reported.length}/${requests.length} 请求`,
+      tagType,
+    };
+  });
+});
+
+interface ReviewToolCallItem {
+  id: string;
+  name: string;
+  offset?: number;
+  offsetLabel?: string;
+  status: 'success' | 'warning' | 'error' | 'pending';
+  statusText: string;
+  statusTagType: 'success' | 'warning' | 'error' | 'info';
+  targetChapter?: string;
+  sourceCount?: number;
+  translationCount?: number;
+  reason?: string;
+  rawArgs?: Record<string, unknown>;
+  rawResult?: string;
+}
+
+const reviewToolCalls = computed<ReviewToolCallItem[]>(() => {
+  const review = props.session?.review;
+  if (!review) return [];
+  const reviewMessages = review.messages.slice(review.initialMessageCount ?? 0);
+
+  const toolResults = new Map<string, { text: string; isError?: boolean }>();
+  for (const msg of reviewMessages) {
+    if (msg.role === 'toolResult' && msg.toolCallId) {
+      const text = Array.isArray(msg.content)
+        ? msg.content
+            .map((b: any) =>
+              b.type === 'text' ? b.text : typeof b === 'string' ? b : '',
+            )
+            .join('')
+        : typeof msg.content === 'string'
+          ? msg.content
+          : '';
+      toolResults.set(msg.toolCallId, { text, isError: !!msg.isError });
+    }
+  }
+
+  const calls: ReviewToolCallItem[] = [];
+
+  for (const msg of reviewMessages) {
+    if (msg.role === 'assistant' && Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (block.type === 'toolCall') {
+          const callId = block.id;
+          const name = block.name;
+          const args = (block.arguments ?? {}) as Record<string, any>;
+          const res = toolResults.get(callId);
+
+          if (name === 'get_chapter_context') {
+            const offset = args?.offset;
+            const offsetLabel =
+              offset === -1
+                ? '前 1 章'
+                : offset === 1
+                  ? '后 1 章'
+                  : offset === -2
+                    ? '前 2 章'
+                    : offset === 2
+                      ? '后 2 章'
+                      : `偏移 ${offset}`;
+
+            if (!res) {
+              calls.push({
+                id: callId,
+                name,
+                offset,
+                offsetLabel,
+                status: 'pending',
+                statusText: '读取中...',
+                statusTagType: 'info',
+                rawArgs: args,
+              });
+              continue;
+            }
+
+            if (res.isError) {
+              calls.push({
+                id: callId,
+                name,
+                offset,
+                offsetLabel,
+                status: 'error',
+                statusText: '执行错误',
+                statusTagType: 'error',
+                reason: res.text,
+                rawArgs: args,
+                rawResult: res.text,
+              });
+              continue;
+            }
+
+            try {
+              const parsed = JSON.parse(res.text) as DeltaChapterContext;
+              if (parsed.available) {
+                calls.push({
+                  id: callId,
+                  name,
+                  offset,
+                  offsetLabel,
+                  status: 'success',
+                  statusText: '读取成功',
+                  statusTagType: 'success',
+                  targetChapter: parsed.title || parsed.chapterId,
+                  sourceCount: parsed.source?.length ?? 0,
+                  translationCount: parsed.translation?.length ?? 0,
+                  rawArgs: args,
+                  rawResult: res.text,
+                });
+              } else {
+                calls.push({
+                  id: callId,
+                  name,
+                  offset,
+                  offsetLabel,
+                  status: 'warning',
+                  statusText: '不可用',
+                  statusTagType: 'warning',
+                  reason: parsed.reason,
+                  rawArgs: args,
+                  rawResult: res.text,
+                });
+              }
+            } catch {
+              calls.push({
+                id: callId,
+                name,
+                offset,
+                offsetLabel,
+                status: 'error',
+                statusText: '返回异常',
+                statusTagType: 'error',
+                reason: res.text,
+                rawArgs: args,
+                rawResult: res.text,
+              });
+            }
+          } else if (name === 'submit_review') {
+            const changesCount = Array.isArray(args?.changes)
+              ? args.changes.length
+              : 0;
+            const unresolvedCount = Array.isArray(args?.unresolved)
+              ? args.unresolved.length
+              : 0;
+            const isError = res?.isError;
+            calls.push({
+              id: callId,
+              name,
+              status: !res ? 'pending' : isError ? 'error' : 'success',
+              statusText: !res
+                ? '提交中...'
+                : isError
+                  ? '提交失败'
+                  : '提交成功',
+              statusTagType: !res ? 'info' : isError ? 'error' : 'success',
+              reason: isError ? res?.text : undefined,
+              targetChapter: `修订 ${changesCount} 段 · 未解决 ${unresolvedCount} 项`,
+              rawArgs: args,
+              rawResult: res?.text,
+            });
+          } else {
+            calls.push({
+              id: callId,
+              name,
+              status: res?.isError ? 'error' : res ? 'success' : 'pending',
+              statusText: res?.isError ? '失败' : res ? '已执行' : '等待中',
+              statusTagType: res?.isError ? 'error' : res ? 'success' : 'info',
+              reason: res?.text,
+              rawArgs: args,
+              rawResult: res?.text,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  if (review.pendingAssistant?.message?.content) {
+    for (const block of review.pendingAssistant.message.content) {
+      if (block.type === 'toolCall' && !calls.some((c) => c.id === block.id)) {
+        const name = block.name;
+        const args = (block.arguments ?? {}) as Record<string, any>;
+        const offset = args?.offset;
+        const offsetLabel =
+          offset === -1
+            ? '前 1 章'
+            : offset === 1
+              ? '后 1 章'
+              : `偏移 ${offset}`;
+        calls.push({
+          id: block.id,
+          name,
+          offset,
+          offsetLabel,
+          status: 'pending',
+          statusText: '结算中...',
+          statusTagType: 'info',
+          rawArgs: args,
+        });
+      }
+    }
+  }
+
+  return calls;
+});
+
+const defaultExpandedReviewPanels = computed(() => {
+  const s = props.session;
+  if (!s?.review) return [];
+  const list: string[] = [];
+  if (s.review.changes?.length) {
+    list.push('review-changes');
+  }
+  if (
+    reviewToolCalls.value.some(
+      (c) => c.status === 'warning' || c.status === 'error',
+    )
+  ) {
+    list.push('review-tools');
+  }
+  return list;
+});
 </script>
 
 <template>
@@ -606,86 +992,349 @@ function restartDelta() {
         </n-collapse-item>
       </n-collapse>
 
-      <n-card v-if="session.review" size="small" style="margin-bottom: 12px">
-        <template #header>章末 Review · {{ reviewSummary }}</template>
-        <n-flex vertical :size="8">
-          <n-text depth="3" style="font-size: 12px">
-            {{
-              session.review.options.mode === 'append'
-                ? '追加原会话'
-                : '新开会话'
-            }}
-            · 已请求 {{ session.review.totalAttempts }} 次 · 重试窗口
-            {{ session.review.window }}
-          </n-text>
-          <n-flex :size="6">
+      <!-- 章末 Review 审校看板 -->
+      <div v-if="session.review" class="delta-review-container">
+        <!-- 头部 Header -->
+        <div class="delta-review-header">
+          <div class="delta-review-header-left">
+            <span class="delta-review-title">章末 Review</span>
             <n-tag
-              v-for="metric of reviewMetrics"
-              :key="metric.key"
               size="small"
               :bordered="false"
+              round
+              :type="reviewStatusBadge.type"
+              class="delta-review-status-tag"
             >
-              审校 {{ metric.label }} {{ metric.value }}
+              <span
+                v-if="reviewStatusBadge.spinning"
+                class="delta-review-pulse-dot"
+              />
+              {{ reviewStatusBadge.text }}
             </n-tag>
-          </n-flex>
-          <n-alert
-            v-if="session.review.unresolved?.length"
-            type="warning"
-            :show-icon="false"
-          >
-            <n-flex vertical :size="4">
-              <n-text>未解决 {{ session.review.unresolved.length }} 项</n-text>
-              <n-text
-                v-for="finding of session.review.unresolved"
-                :key="finding.paragraphId"
-                style="overflow-wrap: anywhere"
-              >
-                {{ finding.paragraphId }}：{{ finding.reason }}
-              </n-text>
-            </n-flex>
-          </n-alert>
-          <n-collapse v-if="reviewThinking || session.review.changes?.length">
-            <n-collapse-item
-              v-if="reviewThinking"
-              title="审校思考 / 摘要"
-              name="review-thinking"
+            <span class="delta-review-session-mode">
+              {{
+                session.review.options.mode === 'append'
+                  ? '追加原会话'
+                  : '新开会话'
+              }}
+              · 已请求 {{ session.review.totalAttempts }} 次 · 重试窗口
+              {{ session.review.window }}
+            </span>
+          </div>
+        </div>
+
+        <!-- Token 指标行 -->
+        <div class="delta-review-metrics-row">
+          <span class="delta-review-metrics-label">审校消耗：</span>
+          <n-flex :size="6" align="center" style="display: inline-flex">
+            <n-tooltip
+              v-for="metric of formattedReviewMetrics"
+              :key="metric.key"
+              trigger="hover"
             >
-              <div class="delta-thinking-content">{{ reviewThinking }}</div>
-            </n-collapse-item>
-            <n-collapse-item
-              v-if="session.review.changes?.length"
-              :title="`修改 ${session.review.changes.length} 段`"
-              name="review-changes"
-            >
-              <n-flex vertical :size="12">
-                <div
-                  v-for="change of session.review.changes"
-                  :key="change.paragraphId"
-                  style="overflow-wrap: anywhere"
+              <template #trigger>
+                <n-tag
+                  size="tiny"
+                  :bordered="false"
+                  :type="metric.tagType"
+                  class="delta-review-metric-tag"
                 >
-                  <n-text strong>
-                    {{ change.paragraphId }} · {{ change.category }}
-                  </n-text>
-                  <div>
-                    <n-text depth="3">原译：</n-text>
-                    {{
-                      session.review.originalTranslations[change.paragraphId]
-                    }}
-                  </div>
-                  <div>
-                    <n-text depth="3">审校：</n-text>
-                    {{ change.translation }}
-                  </div>
-                  <div>
-                    <n-text depth="3">原因：</n-text>
-                    {{ change.reason }}
+                  {{ metric.label }} {{ metric.displayValue }}
+                </n-tag>
+              </template>
+              <span>
+                {{ metric.label }}：{{ metric.displayValue }}（{{
+                  metric.coverageText
+                }}）
+              </span>
+            </n-tooltip>
+          </n-flex>
+        </div>
+
+        <!-- 待确认项 (Unresolved) -->
+        <div
+          v-if="session.review.unresolved?.length"
+          class="delta-review-unresolved-box"
+        >
+          <div class="delta-unresolved-header">
+            <span class="delta-unresolved-title">
+              待确认项（未解决 {{ session.review.unresolved.length }} 项）
+            </span>
+          </div>
+          <div class="delta-unresolved-list">
+            <div
+              v-for="finding of session.review.unresolved"
+              :key="finding.paragraphId"
+              class="delta-unresolved-item"
+            >
+              <span
+                class="delta-para-badge"
+                title="点击定位到下方段落"
+                @click="scrollToParagraph(finding.paragraphId)"
+              >
+                #{{ finding.paragraphId }}
+              </span>
+              <span class="delta-unresolved-reason">{{ finding.reason }}</span>
+              <n-button
+                text
+                size="tiny"
+                type="primary"
+                class="delta-jump-btn"
+                @click="scrollToParagraph(finding.paragraphId)"
+              >
+                定位
+              </n-button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 折叠面板集合 -->
+        <n-collapse
+          :default-expanded-names="defaultExpandedReviewPanels"
+          class="delta-review-collapse"
+        >
+          <!-- 1. 上下文与工具调用记录 (ChatGPT 建议) -->
+          <n-collapse-item name="review-tools">
+            <template #header>
+              <div class="delta-collapse-title-row">
+                <span>上下文与工具调用</span>
+                <n-tag
+                  v-if="reviewToolCalls.length"
+                  size="tiny"
+                  :bordered="false"
+                  round
+                  type="info"
+                  style="margin-left: 6px"
+                >
+                  {{ reviewToolCalls.length }} 次记录
+                </n-tag>
+              </div>
+            </template>
+
+            <div v-if="!reviewToolCalls.length" class="delta-tools-empty">
+              本次审校直接提交，未请求相邻章节上下文。
+            </div>
+            <div v-else class="delta-tools-list">
+              <div
+                v-for="(call, idx) of reviewToolCalls"
+                :key="call.id || idx"
+                class="delta-tool-item"
+                :class="'delta-tool-status-' + call.status"
+              >
+                <div class="delta-tool-header">
+                  <div class="delta-tool-meta">
+                    <n-tag
+                      v-if="call.name === 'get_chapter_context'"
+                      size="small"
+                      round
+                      type="info"
+                      :bordered="false"
+                    >
+                      读相邻章 · {{ call.offsetLabel }}
+                    </n-tag>
+                    <n-tag
+                      v-else-if="call.name === 'submit_review'"
+                      size="small"
+                      round
+                      type="primary"
+                      :bordered="false"
+                    >
+                      提交审校 (submit_review)
+                    </n-tag>
+                    <n-tag v-else size="small" round :bordered="false">
+                      {{ call.name }}
+                    </n-tag>
+
+                    <n-tag
+                      size="tiny"
+                      :bordered="false"
+                      :type="call.statusTagType"
+                    >
+                      {{ call.statusText }}
+                    </n-tag>
                   </div>
                 </div>
-              </n-flex>
-            </n-collapse-item>
-          </n-collapse>
-        </n-flex>
-      </n-card>
+
+                <div class="delta-tool-body">
+                  <!-- 成功读取相邻章 -->
+                  <template
+                    v-if="
+                      call.name === 'get_chapter_context' &&
+                      call.status === 'success'
+                    "
+                  >
+                    <div class="delta-tool-detail">
+                      <span class="delta-tool-label">目标章节：</span>
+                      <span class="delta-tool-value font-medium">
+                        {{ call.targetChapter }}
+                      </span>
+                    </div>
+                    <div class="delta-tool-detail">
+                      <span class="delta-tool-label">内容段数：</span>
+                      <span class="delta-tool-value">
+                        原文 {{ call.sourceCount }} 段
+                        <template v-if="call.translationCount">
+                          · 已有译文 {{ call.translationCount }} 段
+                        </template>
+                      </span>
+                    </div>
+                  </template>
+
+                  <!-- 相邻章不可用/超出限制 -->
+                  <template
+                    v-else-if="
+                      call.name === 'get_chapter_context' &&
+                      call.status === 'warning'
+                    "
+                  >
+                    <div class="delta-tool-detail text-amber-600">
+                      <span class="delta-tool-label">不可用原因：</span>
+                      <span>{{ call.reason }}</span>
+                    </div>
+                  </template>
+
+                  <!-- 错误 -->
+                  <template v-else-if="call.status === 'error'">
+                    <div class="delta-tool-detail text-red-600">
+                      <span class="delta-tool-label">失败原因：</span>
+                      <span>{{ call.reason }}</span>
+                    </div>
+                  </template>
+
+                  <!-- 提交审校 -->
+                  <template v-else-if="call.name === 'submit_review'">
+                    <div class="delta-tool-detail">
+                      <span class="delta-tool-label">提交内容：</span>
+                      <span>{{ call.targetChapter }}</span>
+                    </div>
+                    <div
+                      v-if="call.reason"
+                      class="delta-tool-detail text-red-600"
+                    >
+                      <span class="delta-tool-label">失败原因：</span>
+                      <span>{{ call.reason }}</span>
+                    </div>
+                  </template>
+                </div>
+              </div>
+            </div>
+          </n-collapse-item>
+
+          <!-- 2. 审校思考 / 摘要 -->
+          <n-collapse-item
+            v-if="reviewThinking"
+            title="审校思考 / 摘要"
+            name="review-thinking"
+          >
+            <div class="delta-thinking-content">{{ reviewThinking }}</div>
+          </n-collapse-item>
+
+          <!-- 3. 修订明细 (若有修改) -->
+          <n-collapse-item
+            v-if="session.review.changes?.length"
+            name="review-changes"
+          >
+            <template #header>
+              <div class="delta-collapse-title-row">
+                <span>修订明细</span>
+                <n-tag
+                  size="tiny"
+                  :bordered="false"
+                  round
+                  type="success"
+                  style="margin-left: 6px"
+                >
+                  {{ session.review.changes.length }} 处修改
+                </n-tag>
+              </div>
+            </template>
+
+            <div class="delta-changes-list">
+              <div
+                v-for="change of computedReviewChanges"
+                :key="change.paragraphId"
+                class="delta-change-card"
+              >
+                <!-- 卡片顶栏：段落号 + 分类 Tag + 定位按钮 -->
+                <div class="delta-change-card-header">
+                  <div class="delta-change-card-meta">
+                    <span
+                      class="delta-para-badge"
+                      title="点击定位到下方段落"
+                      @click="scrollToParagraph(change.paragraphId)"
+                    >
+                      #{{ change.paragraphId }}
+                    </span>
+                    <n-tag
+                      size="tiny"
+                      :bordered="false"
+                      round
+                      :type="change.categoryType"
+                    >
+                      {{ change.categoryLabel }}
+                    </n-tag>
+                  </div>
+                  <n-button
+                    text
+                    size="tiny"
+                    type="primary"
+                    class="delta-jump-btn"
+                    @click="scrollToParagraph(change.paragraphId)"
+                  >
+                    定位到段落
+                  </n-button>
+                </div>
+
+                <!-- Diff 对照区 -->
+                <div class="delta-change-diff-box">
+                  <!-- 原译行 -->
+                  <div class="delta-diff-row delta-diff-orig">
+                    <span class="delta-diff-badge">- 原译</span>
+                    <span class="delta-diff-content">
+                      <template
+                        v-if="change.diff.origDiff || change.diff.newDiff"
+                      >
+                        {{ change.diff.prefix }}
+                        <del class="delta-diff-del">
+                          {{ change.diff.origDiff }}
+                        </del>
+                        {{ change.diff.suffix }}
+                      </template>
+                      <template v-else>
+                        {{ change.originalText }}
+                      </template>
+                    </span>
+                  </div>
+                  <!-- 审校行 -->
+                  <div class="delta-diff-row delta-diff-new">
+                    <span class="delta-diff-badge">+ 审校</span>
+                    <span class="delta-diff-content">
+                      <template
+                        v-if="change.diff.origDiff || change.diff.newDiff"
+                      >
+                        {{ change.diff.prefix }}
+                        <ins class="delta-diff-ins">
+                          {{ change.diff.newDiff }}
+                        </ins>
+                        {{ change.diff.suffix }}
+                      </template>
+                      <template v-else>
+                        {{ change.translation }}
+                      </template>
+                    </span>
+                  </div>
+                </div>
+
+                <!-- 审校依据 -->
+                <div v-if="change.reason" class="delta-change-reason">
+                  <span class="delta-reason-prefix">依据：</span>
+                  <span class="delta-reason-text">{{ change.reason }}</span>
+                </div>
+              </div>
+            </div>
+          </n-collapse-item>
+        </n-collapse>
+      </div>
 
       <!-- 原文 vs 译文 双语对照表格 -->
       <n-table :bordered="false" size="small" class="delta-preview-table">
@@ -696,7 +1345,12 @@ function restartDelta() {
           </tr>
         </thead>
         <tbody>
-          <tr v-for="(p, i) of displayParagraphs" :key="i">
+          <tr
+            v-for="(p, i) of displayParagraphs"
+            :key="i"
+            :id="'delta-para-' + p.id"
+            :class="{ 'delta-row-highlighted': highlightedParaId === p.id }"
+          >
             <td class="delta-jp">{{ p.jp }}</td>
             <td class="delta-zh">
               <template v-if="p.zh">{{ p.zh }}</template>
@@ -832,5 +1486,313 @@ function restartDelta() {
 .delta-translating {
   color: v-bind('themeVars.infoColor');
   font-size: 12px;
+}
+
+/* --- 章末 Review 审校看板增强样式 --- */
+.delta-review-container {
+  margin: 8px 0 14px;
+  background: rgba(128, 128, 128, 0.04);
+  border: 1px solid rgba(128, 128, 128, 0.12);
+  border-radius: 8px;
+  padding: 10px 14px 12px;
+  transition: all 0.2s ease;
+}
+.delta-review-container:hover {
+  border-color: rgba(128, 128, 128, 0.2);
+}
+.delta-review-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.delta-review-header-left {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.delta-review-title {
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.4;
+  color: v-bind('themeVars.textColor1');
+}
+.delta-review-pulse-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background-color: currentColor;
+  margin-right: 4px;
+  animation: deltaPulseDot 1.4s infinite ease-in-out;
+}
+@keyframes deltaPulseDot {
+  0%,
+  100% {
+    opacity: 0.3;
+    transform: scale(0.8);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.2);
+  }
+}
+.delta-review-session-mode {
+  font-size: 12px;
+  color: v-bind('themeVars.textColor3');
+}
+.delta-review-metrics-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.delta-review-metrics-label {
+  font-size: 12px;
+  color: v-bind('themeVars.textColor3');
+}
+.delta-review-metric-tag {
+  cursor: default;
+}
+.delta-review-unresolved-box {
+  margin-bottom: 10px;
+  padding: 8px 12px;
+  background: rgba(245, 158, 11, 0.08);
+  border: 1px solid rgba(245, 158, 11, 0.25);
+  border-radius: 6px;
+}
+.delta-unresolved-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #d97706;
+  margin-bottom: 6px;
+}
+.delta-unresolved-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.delta-unresolved-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+.delta-unresolved-reason {
+  flex: 1;
+  color: v-bind('themeVars.textColor2');
+  overflow-wrap: anywhere;
+}
+.delta-collapse-title-row {
+  display: flex;
+  align-items: center;
+}
+.delta-review-collapse {
+  background: transparent;
+}
+.delta-tools-empty {
+  font-size: 12px;
+  color: v-bind('themeVars.textColor3');
+  padding: 6px 0;
+}
+.delta-tools-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 4px 0;
+}
+.delta-tool-item {
+  background: rgba(128, 128, 128, 0.04);
+  border: 1px solid rgba(128, 128, 128, 0.1);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+.delta-tool-item.delta-tool-status-success {
+  border-left: 3px solid #16a34a;
+}
+.delta-tool-item.delta-tool-status-warning {
+  border-left: 3px solid #d97706;
+}
+.delta-tool-item.delta-tool-status-error {
+  border-left: 3px solid #dc2626;
+}
+.delta-tool-item.delta-tool-status-pending {
+  border-left: 3px solid #2563eb;
+}
+.delta-tool-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+.delta-tool-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.delta-tool-body {
+  font-size: 12px;
+  line-height: 1.5;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.delta-tool-detail {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.delta-tool-label {
+  color: v-bind('themeVars.textColor3');
+  flex-shrink: 0;
+}
+.delta-changes-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 6px 0;
+}
+.delta-change-card {
+  background: rgba(128, 128, 128, 0.03);
+  border: 1px solid rgba(128, 128, 128, 0.1);
+  border-radius: 6px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.delta-change-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.delta-change-card-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.delta-para-badge {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  font-weight: 600;
+  color: v-bind('themeVars.primaryColor');
+  background: rgba(128, 128, 128, 0.08);
+  padding: 1px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  user-select: none;
+}
+.delta-para-badge:hover {
+  background: v-bind('themeVars.primaryColor');
+  color: #fff;
+}
+.delta-jump-btn {
+  font-size: 12px;
+  opacity: 0.8;
+}
+.delta-jump-btn:hover {
+  opacity: 1;
+}
+.delta-change-diff-box {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border-radius: 4px;
+  overflow: hidden;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.delta-diff-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: 4px;
+}
+.delta-diff-orig {
+  background: rgba(239, 68, 68, 0.05);
+  border-left: 3px solid rgba(239, 68, 68, 0.4);
+}
+.delta-diff-new {
+  background: rgba(34, 197, 94, 0.06);
+  border-left: 3px solid rgba(34, 197, 94, 0.6);
+}
+.delta-diff-badge {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 0 4px;
+  border-radius: 3px;
+  flex-shrink: 0;
+  user-select: none;
+}
+.delta-diff-orig .delta-diff-badge {
+  color: #dc2626;
+  background: rgba(239, 68, 68, 0.12);
+}
+.delta-diff-new .delta-diff-badge {
+  color: #16a34a;
+  background: rgba(34, 197, 94, 0.14);
+}
+.delta-diff-content {
+  flex: 1;
+  word-break: break-all;
+  color: v-bind('themeVars.textColor1');
+}
+.delta-diff-del {
+  background-color: rgba(239, 68, 68, 0.18);
+  color: #dc2626;
+  text-decoration: line-through;
+  padding: 1px 3px;
+  border-radius: 3px;
+  font-weight: 500;
+}
+.delta-diff-ins {
+  background-color: rgba(34, 197, 94, 0.2);
+  color: #15803d;
+  text-decoration: none;
+  padding: 1px 3px;
+  border-radius: 3px;
+  font-weight: 500;
+}
+.delta-change-reason {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: v-bind('themeVars.textColor3');
+  background: rgba(128, 128, 128, 0.04);
+  padding: 5px 8px;
+  border-radius: 4px;
+}
+.delta-reason-prefix {
+  font-weight: 500;
+  flex-shrink: 0;
+}
+.delta-reason-text {
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+.delta-row-highlighted {
+  animation: deltaRowPulse 2.4s ease-out;
+}
+@keyframes deltaRowPulse {
+  0% {
+    background-color: rgba(24, 160, 88, 0.35);
+  }
+  30% {
+    background-color: rgba(24, 160, 88, 0.35);
+  }
+  100% {
+    background-color: transparent;
+  }
 }
 </style>

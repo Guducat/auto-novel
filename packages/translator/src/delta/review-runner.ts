@@ -178,13 +178,21 @@ export async function runDeltaReview(
     const calls = message.content.filter(
       (b): b is ToolCall => b.type === 'toolCall',
     );
-    const call = calls[0];
+    const contextCall = calls.find(
+      (call) => call.name === 'get_chapter_context',
+    );
+    const deferSubmission =
+      calls.length === 2 &&
+      contextCall !== undefined &&
+      calls.some((call) => call.name === 'submit_review');
+    // A submission generated alongside a read cannot use that read's result.
+    const call = deferSubmission ? contextCall! : calls[0];
     let error: string | undefined;
     let result: DeltaSubmitReview | undefined;
     let context: DeltaChapterContext | undefined;
     if (message.stopReason === 'length')
       error = '审校输出截断，未执行任何工具。请完整提交较少的必要修改。';
-    else if (calls.length !== 1)
+    else if (calls.length !== 1 && !deferSubmission)
       error = '审校每轮必须恰好调用一个工具，不能混合或重复提交。';
     else if (call.name === 'submit_review') {
       try {
@@ -254,15 +262,25 @@ export async function runDeltaReview(
         : result
           ? '审校结果已保存，审校结束。'
           : JSON.stringify(context);
-      for (const item of calls)
+      for (const item of calls) {
+        const deferred =
+          deferSubmission && item.name === 'submit_review' && !error;
         r.messages.push({
           role: 'toolResult',
           toolCallId: item.id,
           toolName: item.name,
-          content: [{ type: 'text', text: feedback }],
-          isError: !!error,
+          content: [
+            {
+              type: 'text',
+              text: deferred
+                ? '本次 submit_review 未执行，译稿未修改。请先阅读 get_chapter_context 返回的上下文或不可用原因，下一轮重新判断并单独提交审校结果；无需修改可提交 changes: []，无需疑问项可提交 unresolved: []。不要直接沿用本轮尚未参考读取结果的修改。'
+                : feedback,
+            },
+          ],
+          isError: !!error || deferred,
           timestamp: Date.now(),
         });
+      }
       if (!calls.length)
         r.messages.push({
           role: 'user',

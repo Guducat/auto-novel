@@ -260,6 +260,10 @@ export class DeltaController {
     return this.discard((session) => session.identity.novelId === novelId);
   }
 
+  discardPending(): Promise<void> {
+    return this.discard((session) => session.phase !== 'completed');
+  }
+
   async skipReview(
     sessionId: string,
     worker: GptPipelineWorker,
@@ -601,8 +605,19 @@ export class DeltaController {
       if (this.sessions.get(session.id)?.revision !== session.revision)
         await this.save(session);
     }
+    // Older checkpoints may have sent image-only pages into Review.
+    // Keep their request history, but resume through the normal submission path.
+    if (session.phase === 'reviewing' && !session.batches.length)
+      session = await this.patch(session, {
+        phase: 'readyToSubmit',
+        pauseReason: undefined,
+        review: session.review
+          ? { ...session.review, skipped: true }
+          : undefined,
+      });
     if (
       session.phase === 'readyToSubmit' &&
+      session.batches.length > 0 &&
       session.reviewOptions?.enabled &&
       !session.review?.completed &&
       !session.review?.skipped
