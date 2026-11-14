@@ -161,6 +161,8 @@ export class TaskState {
   readonly taskDesc: string;
   chapters: ChapterMeta[] = [];
   readonly chapterStates = new Map<string, ChapterSegmentState>();
+  /** 完成后仅保留用量数字，正文和思考内容仍随章节状态释放。 */
+  readonly completedHarnessUsage = new Map<string, HarnessUsageRecord[]>();
   /** initChapters 执行完毕后设为 true */
   initialized = false;
 
@@ -198,9 +200,13 @@ export class TaskState {
     if (status === 'done') {
       const state = this.chapterStates.get(chapterId);
       if (state) {
+        if (state.harnessUsage.length) {
+          this.completedHarnessUsage.set(chapterId, state.harnessUsage);
+        }
         // 预览可能仍持有状态引用，先释放正文，再移除工作区中的状态。
         state.segments = [];
         state.ranges = [];
+        state.reasoning = [];
         state.ready = false;
       }
       this.chapterStates.delete(chapterId);
