@@ -525,6 +525,7 @@ export function useWorkspaceRuntime(translatorId: TranslatorId) {
         const preset = getHarnessModelPreset(
           harnessPreset,
           (w as GptPipelineWorker).model,
+          w as GptPipelineWorker,
         );
         const { createHarnessMode } = await import(
           '@/domain/translator/harness/HarnessMode'

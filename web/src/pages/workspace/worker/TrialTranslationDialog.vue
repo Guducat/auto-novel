@@ -297,7 +297,7 @@ const translate = async () => {
       const translatedLines = await translateChapter({
         source: source.split('\n'),
         glossary: glossary.value,
-        preset: getHarnessModelPreset(harnessPreset, worker.model),
+        preset: getHarnessModelPreset(harnessPreset, worker.model, worker),
         apiKey: worker.key,
         signal: abortController.signal,
         onBatchesReady: (batches) => {

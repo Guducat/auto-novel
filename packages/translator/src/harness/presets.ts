@@ -1,6 +1,12 @@
 import type { PiAiProtocol } from '../translator/pi-ai-api';
 import type { ModelCost } from '@earendil-works/pi-ai';
 import { deepseekPresets } from './presets/deepseek';
+import {
+  buildOpenAiProfileParams,
+  openAiProfiles,
+  type openAiProfileId,
+} from '../translator/profiles/openai';
+import type { ProfileValues } from '../translator/profiles/types';
 
 export type HarnessOutputFormat = 'json' | 'paragraph-id' | 'lines';
 
@@ -55,9 +61,34 @@ export function findHarnessPresetGroup(
 export function getHarnessModelPreset(
   group: HarnessPresetGroup,
   model: string,
+  connection?: {
+    endpoint: string;
+    profile?: { id: openAiProfileId; values?: ProfileValues };
+  },
 ): HarnessPreset {
-  const preset = group.models.find((preset) => preset.model === model);
-  if (!preset)
-    throw new Error(`Harness 预设 ${group.label} 中没有模型 ${model}`);
-  return preset;
+  // EXP：任意模型复用所选组的翻译规则与上下文模式。
+  const matched = group.models.find((preset) => preset.model === model);
+  const preset = matched ?? group.models[0];
+  const profile = connection?.profile;
+  const apiFormat = openAiProfiles.find(
+    (item) => item.id === profile?.id,
+  )?.apiFormat;
+  return {
+    ...preset,
+    model,
+    endpoint: connection?.endpoint ?? preset.endpoint,
+    protocol:
+      apiFormat === 'openai'
+        ? 'openai-completions'
+        : apiFormat ?? preset.protocol,
+    requestParams: profile
+      ? buildOpenAiProfileParams(profile.id, profile.values)
+      : matched
+        ? preset.requestParams
+        : {},
+    // 未收录模型的价格未知，不能套用 DeepSeek 的价格。
+    cost: matched
+      ? preset.cost
+      : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  };
 }

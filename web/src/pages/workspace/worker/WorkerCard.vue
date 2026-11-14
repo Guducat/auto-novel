@@ -78,7 +78,7 @@ const testWorker = async () => {
       textZh = await translateChapter({
         source: textJp,
         glossary: {},
-        preset: getHarnessModelPreset(harnessPreset, worker.model),
+        preset: getHarnessModelPreset(harnessPreset, worker.model, worker),
         apiKey: worker.key,
         signal,
       });
