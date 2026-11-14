@@ -10,12 +10,15 @@ import {
   VerticalAlignBottomOutlined,
   RefreshOutlined,
   DeleteOutlineOutlined,
+  FileDownloadOutlined,
 } from '@vicons/material';
 import type { ChapterMeta, TaskState } from '@/domain/translator/TaskState';
 import { ChapterSegmentState } from '@/domain/translator/TaskState';
 import type { TranslateJob, TranslateJobRecord } from '@/model/Translator';
 import { TranslateTaskDescriptor } from '@/model/Translator';
 import { createTranslationTask } from '@/domain/translator/TranslationTask/createTranslationTask';
+import { downloadFile } from '@/util';
+import type { HarnessUsageRecord } from '@auto-novel/translator/harness';
 import type {
   TranslationTask,
   TranslatorId,
@@ -117,6 +120,53 @@ function retryAllFailed() {
 function createTask(taskDesc: string): TranslationTask {
   const { desc, params } = TranslateTaskDescriptor.parse(taskDesc);
   return createTranslationTask(desc, props.translatorId, params);
+}
+
+const harnessUsage = computed(
+  () =>
+    new Map([
+      ...(props.taskState?.completedHarnessUsage ?? []),
+      ...[...(props.taskState?.chapterStates ?? [])]
+        .filter(([, chapter]) => chapter.harnessUsage.length > 0)
+        .map(([id, chapter]) => [id, chapter.harnessUsage] as const),
+    ]),
+);
+
+function summarizeUsage(requests: HarnessUsageRecord[]) {
+  const total = {
+    requests: requests.length,
+    uncachedInputTokens: 0,
+    cachedInputTokens: 0,
+    outputTokens: 0,
+    estimatedCostCny: 0,
+  };
+  for (const { usage } of requests) {
+    total.uncachedInputTokens += usage.input;
+    total.cachedInputTokens += usage.cacheRead;
+    total.outputTokens += usage.output;
+    total.estimatedCostCny += usage.cost.total;
+  }
+  return total;
+}
+
+function downloadHarnessUsage() {
+  const chapters = [...harnessUsage.value].map(([chapterId, requests]) => ({
+    chapterId,
+    requests,
+    total: summarizeUsage(requests),
+  }));
+  const report = {
+    task: props.job.description,
+    exportedAt: new Date().toISOString(),
+    total: summarizeUsage(chapters.flatMap((chapter) => chapter.requests)),
+    chapters,
+  };
+  downloadFile(
+    `${props.job.description}-Harness用量.json`.replace(/[\\/:*?"<>|]/g, '_'),
+    new Blob([JSON.stringify(report, null, 2)], {
+      type: 'application/json;charset=utf-8',
+    }),
+  );
 }
 
 const showPreview = ref(false);
@@ -230,6 +280,13 @@ const closePreview = () => {
                 icon-only
                 color="warning"
                 @action="retryAllFailed"
+              />
+              <WorkspaceActionButton
+                v-if="translatorId === 'gpt'"
+                label="导出用量"
+                :icon="FileDownloadOutlined"
+                :disabled="!harnessUsage.size"
+                @action="downloadHarnessUsage"
               />
               <WorkspaceActionButton
                 label="删除任务"
