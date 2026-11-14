@@ -127,6 +127,13 @@ export async function translateChapter({
     `<chapter_source>\n${numberedLines(toParagraphs(source))}\n</chapter_source>`,
     `<glossary>\n${formatGlossary(fullGlossary)}\n</glossary>`,
   ].join('\n\n');
+  const usageTotal = {
+    requests: 0,
+    uncachedInputTokens: 0,
+    cachedInputTokens: 0,
+    outputTokens: 0,
+    estimatedCostCny: 0,
+  };
 
   const batches = planBatches(source.length);
   onBatchesReady?.(batches);
@@ -185,7 +192,16 @@ ${outputInstructions[preset.outputFormat]}
           ],
           requestParams: preset.requestParams,
           cost: preset.cost,
-          onUsage: (usage) =>
+          onUsage: (usage) => {
+            usageTotal.requests++;
+            usageTotal.uncachedInputTokens += usage.input;
+            usageTotal.cachedInputTokens += usage.cacheRead;
+            usageTotal.outputTokens += usage.output;
+            usageTotal.estimatedCostCny += usage.cost.total;
+            console.info(
+              `[Harness ${useConversation ? 'B' : 'A'}] ${preset.model} 批次 ${batch.index + 1} · ${requestLabel}`,
+              JSON.stringify({ usage, total: usageTotal }),
+            );
             onUsage?.({
               model: preset.model,
               batch: batch.index + 1,
@@ -193,7 +209,8 @@ ${outputInstructions[preset.outputFormat]}
               start: batch.start,
               end: batch.end,
               usage,
-            }),
+            });
+          },
         });
         signal?.throwIfAborted();
         // 思考内容在解析前上报：即便这一批最终校验失败，也能在界面里看到原因。
