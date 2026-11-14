@@ -10,6 +10,8 @@ export interface HarnessPreset {
   endpoint: string;
   protocol: PiAiProtocol;
   outputFormat: HarnessOutputFormat;
+  /** 临时 A/B 实验：默认重建单条 user 请求，B 保留完整对话。 */
+  contextMode?: 'rebuild' | 'conversation';
   rules: string;
   requestParams: Record<string, unknown>;
   /** 每百万 token 的人民币参考单价，仅用于费用估算。 */
@@ -23,13 +25,22 @@ export interface HarnessPresetGroup {
   models: HarnessPreset[];
 }
 
-/** 工作区入口和表单共用的预设目录；目前仅注册 DeepSeek。 */
+/** 工作区入口和表单共用的预设目录。 */
 export const harnessPresets = [
   {
     id: 'deepseek',
     label: 'DeepSeek',
     mode: 'harness',
     models: deepseekPresets,
+  },
+  {
+    id: 'deepseek-exp-b',
+    label: 'DeepSeek 实验 B',
+    mode: 'harness',
+    models: deepseekPresets.map((preset) => ({
+      ...preset,
+      contextMode: 'conversation' as const,
+    })),
   },
 ] as const satisfies readonly HarnessPresetGroup[];
 

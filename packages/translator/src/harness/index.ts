@@ -12,7 +12,10 @@
  */
 import type { Glossary, Logger, LineRange } from '../types';
 import type { Usage } from '@earendil-works/pi-ai';
-import { createPiAiCompletion } from '../translator/pi-ai-api';
+import {
+  createPiAiCompletion,
+  type PiAiMessage,
+} from '../translator/pi-ai-api';
 import type { HarnessPreset } from './presets';
 import {
   outputInstructions,
@@ -99,6 +102,9 @@ const toParagraphs = (lines: string[], start = 0): HarnessParagraph[] =>
 const numberedLines = (paragraphs: HarnessParagraph[]) =>
   paragraphs.map(({ id, text }) => `${id}#${text}`).join('\n');
 
+const formatGlossary = (entries: [string, string][]) =>
+  entries.map(([jp, zh]) => `${jp} => ${zh}`).join('\n');
+
 export async function translateChapter({
   source,
   glossary,
@@ -113,13 +119,13 @@ export async function translateChapter({
   onBatchComplete,
 }: HarnessInput): Promise<string[]> {
   const translated: string[] = [];
-  // 每次请求都会重复带上整章原文和术语表：模型看到当前批次之外的内容后，
-  // 更容易保持人物称谓、语气和专有名词的一致。这部分只作为输入，不产生译文输出。
+  const history: PiAiMessage[] = [];
+  const useConversation = preset.contextMode === 'conversation';
+  const fullGlossary = Object.entries(glossary);
+  // A 在每轮重建此前缀，B 将它保留在首条 user 消息中。
   const prefix = [
     `<chapter_source>\n${numberedLines(toParagraphs(source))}\n</chapter_source>`,
-    `<glossary>\n${Object.entries(glossary)
-      .map(([jp, zh]) => `${jp} => ${zh}`)
-      .join('\n')}\n</glossary>`,
+    `<glossary>\n${formatGlossary(fullGlossary)}\n</glossary>`,
   ].join('\n\n');
 
   const batches = planBatches(source.length);
@@ -135,14 +141,31 @@ export async function translateChapter({
     const paragraphs = toParagraphs(lines, batch.start);
     const count = paragraphs.length;
     if (count === 0) return lines;
+    const context = useConversation
+      ? history.length === 0
+        ? prefix
+        : `<batch_glossary>\n${formatGlossary(
+            fullGlossary.filter(([jp]) =>
+              lines.some((line) => line.includes(jp)),
+            ),
+          )}\n</batch_glossary>`
+      : `${prefix}\n\n<translated_so_far>\n${numberedLines(toParagraphs(previous))}\n</translated_so_far>`;
+    const batchPrompt = [
+      context,
+      `<current_batch>\n${numberedLines(paragraphs)}\n</current_batch>`,
+      `请返回本批 ${count} 段的译文。`,
+    ].join('\n\n');
     let retryPrompt = '';
     for (let attempt = 0; attempt <= MAX_BATCH_RETRY_COUNT; attempt++) {
       signal?.throwIfAborted();
       const requestLabel =
         attempt === 0 ? attemptLabel : `${attemptLabel} · 修正 ${attempt}`;
-      // 请求结构：system 放翻译规则和输出格式；user 按
-      // 「整章原文 → 已译内容 → 当前批次」摆放，最后明确要求返回本批译文。
-      // 把 current_batch 放在最后，模型更容易把注意力落在真正要翻译的段落上。
+      // A 方案每轮重建单条 user 请求；B 方案只把成功的轮次追加到历史，
+      // 让服务端可以复用稳定前缀，同时避免把失败响应带入后续上下文。
+      const userMessage: PiAiMessage = {
+        role: 'user',
+        content: [batchPrompt, retryPrompt].filter(Boolean).join('\n\n'),
+      };
       try {
         const response = await createPiAiCompletion({
           protocol: preset.protocol,
@@ -157,18 +180,8 @@ export async function translateChapter({
 ${outputInstructions[preset.outputFormat]}
 每段对应一行非空译文，不要合并或拆分段落。`,
             },
-            {
-              role: 'user',
-              content: [
-                prefix,
-                `<translated_so_far>\n${numberedLines(toParagraphs(previous))}\n</translated_so_far>`,
-                `<current_batch>\n${numberedLines(paragraphs)}\n</current_batch>`,
-                `请返回本批 ${count} 段的译文。`,
-                retryPrompt,
-              ]
-                .filter(Boolean)
-                .join('\n\n'),
-            },
+            ...history,
+            userMessage,
           ],
           requestParams: preset.requestParams,
           cost: preset.cost,
@@ -199,12 +212,19 @@ ${outputInstructions[preset.outputFormat]}
           paragraphs,
         );
         let index = 0;
-        return lines.map((line) =>
+        const translatedLines = lines.map((line) =>
           // 恢复原文的段首空格缩进。
           line.trim()
             ? line.match(/^\s*/)![0] + translations[index++].trim()
             : line,
         );
+        if (useConversation) {
+          history.push(userMessage, {
+            role: 'assistant',
+            content: response.text,
+          });
+        }
+        return translatedLines;
       } catch (error) {
         // 请求失败与输出校验失败共用恢复次数，只有主动取消立即退出。
         signal?.throwIfAborted();
