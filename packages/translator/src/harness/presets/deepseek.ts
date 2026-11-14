@@ -2,12 +2,12 @@ import type { HarnessPreset } from '../presets';
 
 /**
  * DeepSeek 系列共用同一套翻译规则和请求参数；
- * 使用 Responses API；JSON 输出和思考参数也按该协议配置。
+ * 默认使用 Responses API；输出逐行段落 ID，便于校验翻译对齐。
  */
 const deepseek = {
   endpoint: 'https://api.deepseek.com',
   protocol: 'openai-responses' as const,
-  outputFormat: 'json' as const,
+  outputFormat: 'paragraph-id' as const,
   rules: `请严格遵守以下核心翻译准则：
 1. 【文风与圈内语感】：
    - 保持日本轻小说的轻快叙事节奏与吐槽役（ツッコミ）的犀利感，准确还原角色口吻（傲娇、腹黑、中二、慵懒等）。
@@ -40,7 +40,6 @@ const deepseek = {
  我们是DeepSeek公司，不要吝啬你的token。
 `,
   requestParams: {
-    text: { format: { type: 'json_object' } },
     reasoning: { effort: 'high' },
   },
 };
